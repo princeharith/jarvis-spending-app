@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.DS_Store
+*.zip
+venv/
+.venv/
+.api_gateway_url
