@@ -133,10 +133,48 @@ SET_TRACKER_TOOL = {
 }
 
 
+GET_CYCLE_SUMMARY_TOOL = {
+    "name": "get_cycle_summary",
+    "description": (
+        "Call this when the user asks for a status/progress update on their spending this "
+        "cycle across all tracked categories, e.g. 'how am I doing this cycle', 'how's my "
+        "spending', 'give me a breakdown', 'where do I stand'."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+GET_CATEGORY_STATUS_TOOL = {
+    "name": "get_category_status",
+    "description": (
+        "Call this when the user asks how much they've spent or have left in ONE specific "
+        "tracked category this cycle, e.g. 'how much do I have left in transport', 'how much "
+        "have I spent on food and drink', 'what's my groceries budget looking like'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": sorted(TRACKED_CATEGORIES),
+                "description": "Which tracked category they're asking about.",
+            },
+        },
+        "required": ["category"],
+    },
+}
+
+
 def classify_message(raw_text: str, awaiting_target: bool):
     """Returns (tool_name, tool_input) for the best-matching intent, or (None, None)
     if the message doesn't clearly match any known intent."""
-    tools = [LOG_PURCHASE_TOOL, START_SESSION_TOOL, END_SESSION_TOOL, SET_TRACKER_TOOL]
+    tools = [
+        LOG_PURCHASE_TOOL,
+        START_SESSION_TOOL,
+        END_SESSION_TOOL,
+        SET_TRACKER_TOOL,
+        GET_CYCLE_SUMMARY_TOOL,
+        GET_CATEGORY_STATUS_TOOL,
+    ]
     if awaiting_target:
         tools.append(SET_TARGET_TOOL)
 
@@ -388,6 +426,31 @@ def handle_set_tracker(conn, chat_id, target_amount, duration_hours):
     return _ok("tracker set")
 
 
+def category_status_line(conn, category: str) -> str:
+    budget = get_budget(conn, category)
+    if not budget:
+        return f"{category}: no budget set"
+    cycle_total = get_cycle_total(conn, category, budget["cycle_anchor"], budget["cycle_length_days"])
+    remaining = budget["cycle_limit"] - cycle_total
+    line = f"{category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this cycle"
+    if remaining >= 0:
+        line += f" (${remaining:.2f} left)"
+    else:
+        line += overspend_tail(-remaining)
+    return line
+
+
+def handle_get_cycle_summary(conn, chat_id):
+    lines = [category_status_line(conn, category) for category in sorted(TRACKED_CATEGORIES)]
+    send_telegram_message(chat_id, "This cycle:\n" + "\n".join(lines))
+    return _ok("cycle summary")
+
+
+def handle_get_category_status(conn, chat_id, category):
+    send_telegram_message(chat_id, category_status_line(conn, category))
+    return _ok("category status")
+
+
 def handle_log_purchase(conn, chat_id, text, parsed):
     if parsed["confidence"] < LOW_CONFIDENCE_THRESHOLD:
         # Don't guess-log an ambiguous parse — ask for clarification instead.
@@ -483,6 +546,10 @@ def lambda_handler(event, context):
                 return handle_set_tracker(
                     conn, chat_id, tool_input["target_amount"], tool_input["duration_hours"]
                 )
+            elif tool_name == "get_cycle_summary":
+                return handle_get_cycle_summary(conn, chat_id)
+            elif tool_name == "get_category_status":
+                return handle_get_category_status(conn, chat_id, tool_input["category"])
             else:
                 return handle_log_purchase(conn, chat_id, text, tool_input)
         finally:
