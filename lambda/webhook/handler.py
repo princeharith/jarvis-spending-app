@@ -164,6 +164,39 @@ GET_CATEGORY_STATUS_TOOL = {
 }
 
 
+CORRECT_LAST_TOOL = {
+    "name": "correct_last_purchase",
+    "description": (
+        "Call this when the user is correcting/amending the MOST RECENTLY logged purchase "
+        "rather than logging a new one, e.g. 'actually that was $25 not $250', 'correction, "
+        "it was $16', 'wrong amount, should be $12', 'that was actually Chipotle not Subway'. "
+        "Only include the field(s) actually being corrected; leave the rest out."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "amount": {"type": "number", "description": "Corrected dollar amount, if being corrected."},
+            "merchant": {"type": "string", "description": "Corrected merchant, if being corrected."},
+            "category": {
+                "type": "string",
+                "enum": sorted(TRACKED_CATEGORIES),
+                "description": "Corrected category, if being corrected.",
+            },
+        },
+    },
+}
+
+UNDO_LAST_TOOL = {
+    "name": "undo_last_purchase",
+    "description": (
+        "Call this when the user wants to remove the most recently logged purchase entirely "
+        "(not correct it, delete it), e.g. 'undo', 'undo last', 'delete that', 'remove the "
+        "last one', 'that shouldn't have been logged'."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+
 def classify_message(raw_text: str, awaiting_target: bool):
     """Returns (tool_name, tool_input) for the best-matching intent, or (None, None)
     if the message doesn't clearly match any known intent."""
@@ -174,6 +207,8 @@ def classify_message(raw_text: str, awaiting_target: bool):
         SET_TRACKER_TOOL,
         GET_CYCLE_SUMMARY_TOOL,
         GET_CATEGORY_STATUS_TOOL,
+        CORRECT_LAST_TOOL,
+        UNDO_LAST_TOOL,
     ]
     if awaiting_target:
         tools.append(SET_TARGET_TOOL)
@@ -213,6 +248,51 @@ def insert_transaction(conn, raw_text: str, parsed: dict, session_id=None) -> No
                 session_id,
             ),
         )
+    conn.commit()
+
+
+def get_last_transaction(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, merchant, amount, category, session_id
+            FROM transactions ORDER BY logged_at DESC, id DESC LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row[0],
+        "merchant": row[1],
+        "amount": float(row[2]),
+        "category": row[3],
+        "session_id": row[4],
+    }
+
+
+def apply_correction(conn, tx_id: int, merchant=None, amount=None, category=None) -> None:
+    fields, params = [], []
+    if merchant is not None:
+        fields.append("merchant = %s")
+        params.append(merchant)
+    if amount is not None:
+        fields.append("amount = %s")
+        params.append(amount)
+    if category is not None:
+        fields.append("category = %s")
+        params.append(category)
+    if not fields:
+        return
+    params.append(tx_id)
+    with conn.cursor() as cur:
+        cur.execute(f"UPDATE transactions SET {', '.join(fields)} WHERE id = %s", params)
+    conn.commit()
+
+
+def delete_transaction(conn, tx_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM transactions WHERE id = %s", (tx_id,))
     conn.commit()
 
 
@@ -451,6 +531,61 @@ def handle_get_category_status(conn, chat_id, category):
     return _ok("category status")
 
 
+def handle_correct_last_purchase(conn, chat_id, tool_input):
+    last = get_last_transaction(conn)
+    if not last:
+        send_telegram_message(chat_id, "No recent purchase to correct.")
+        return _ok("no transaction")
+
+    new_merchant = tool_input.get("merchant")
+    new_amount = tool_input.get("amount")
+    new_category = tool_input.get("category")
+
+    apply_correction(conn, last["id"], merchant=new_merchant, amount=new_amount, category=new_category)
+
+    updated_merchant = new_merchant or last["merchant"]
+    updated_amount = new_amount if new_amount is not None else last["amount"]
+    updated_category = new_category or last["category"]
+
+    reply = (
+        f"Corrected: {last['merchant']} ${last['amount']:.2f} ({last['category']}) -> "
+        f"{updated_merchant} ${updated_amount:.2f} ({updated_category})"
+    )
+
+    budget = get_budget(conn, updated_category)
+    if budget:
+        cycle_total = get_cycle_total(
+            conn, updated_category, budget["cycle_anchor"], budget["cycle_length_days"]
+        )
+        reply += f"\n{updated_category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this cycle."
+        if cycle_total > budget["cycle_limit"]:
+            reply += overspend_tail(cycle_total - budget["cycle_limit"])
+
+    if last["session_id"]:
+        session_total = refresh_session_total(conn, last["session_id"])
+        reply += f"\nGoing out total: ${session_total:.2f}"
+
+    send_telegram_message(chat_id, reply)
+    return _ok("corrected")
+
+
+def handle_undo_last_purchase(conn, chat_id):
+    last = get_last_transaction(conn)
+    if not last:
+        send_telegram_message(chat_id, "No recent purchase to undo.")
+        return _ok("no transaction")
+
+    delete_transaction(conn, last["id"])
+    reply = f"Removed: {last['merchant']} — ${last['amount']:.2f} ({last['category']})"
+
+    if last["session_id"]:
+        session_total = refresh_session_total(conn, last["session_id"])
+        reply += f"\nGoing out total: ${session_total:.2f}"
+
+    send_telegram_message(chat_id, reply)
+    return _ok("undone")
+
+
 def handle_log_purchase(conn, chat_id, text, parsed):
     if parsed["confidence"] < LOW_CONFIDENCE_THRESHOLD:
         # Don't guess-log an ambiguous parse — ask for clarification instead.
@@ -550,6 +685,10 @@ def lambda_handler(event, context):
                 return handle_get_cycle_summary(conn, chat_id)
             elif tool_name == "get_category_status":
                 return handle_get_category_status(conn, chat_id, tool_input["category"])
+            elif tool_name == "correct_last_purchase":
+                return handle_correct_last_purchase(conn, chat_id, tool_input)
+            elif tool_name == "undo_last_purchase":
+                return handle_undo_last_purchase(conn, chat_id)
             else:
                 return handle_log_purchase(conn, chat_id, text, tool_input)
         finally:
