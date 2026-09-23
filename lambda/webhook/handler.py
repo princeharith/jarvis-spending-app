@@ -181,34 +181,34 @@ def insert_transaction(conn, raw_text: str, parsed: dict, session_id=None) -> No
 def get_budget(conn, category: str):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT monthly_limit, cycle_start_day FROM budgets WHERE category = %s",
+            "SELECT cycle_limit, cycle_anchor, cycle_length_days FROM budgets WHERE category = %s",
             (category,),
         )
         row = cur.fetchone()
     if row is None:
         return None
-    return {"monthly_limit": float(row[0]), "cycle_start_day": row[1]}
+    return {"cycle_limit": float(row[0]), "cycle_anchor": row[1], "cycle_length_days": row[2]}
 
 
-def get_cycle_total(conn, category: str, cycle_start_day: int) -> float:
-    # Cycle start: cycle_start_day of this month if we've reached it, else
-    # cycle_start_day of last month. Computed in SQL against the DB's own clock
-    # so it stays consistent regardless of Lambda's clock.
+def get_cycle_total(conn, category: str, cycle_anchor, cycle_length_days: int) -> float:
+    # Cycle start: cycle_anchor plus however many whole cycle_length_days blocks
+    # have elapsed since then. Computed in SQL against the DB's own clock so it
+    # stays consistent regardless of Lambda's clock.
     with conn.cursor() as cur:
         cur.execute(
             """
             WITH bounds AS (
-                SELECT CASE
-                    WHEN EXTRACT(DAY FROM now()) >= %(csd)s
-                        THEN date_trunc('month', now()) + (%(csd)s - 1) * INTERVAL '1 day'
-                    ELSE date_trunc('month', now() - INTERVAL '1 month') + (%(csd)s - 1) * INTERVAL '1 day'
-                END AS cycle_start
+                SELECT (
+                    %(anchor)s::date + (
+                        ((CURRENT_DATE - %(anchor)s::date) / %(length)s::int) * %(length)s::int
+                    ) * INTERVAL '1 day'
+                )::timestamptz AS cycle_start
             )
             SELECT COALESCE(SUM(amount), 0)
             FROM transactions, bounds
             WHERE category = %(category)s AND logged_at >= bounds.cycle_start
             """,
-            {"csd": cycle_start_day, "category": category},
+            {"anchor": cycle_anchor, "length": cycle_length_days, "category": category},
         )
         (total,) = cur.fetchone()
     return float(total)
@@ -414,13 +414,15 @@ def handle_log_purchase(conn, chat_id, text, parsed):
     insert_transaction(conn, text, parsed, session_id=session_id)
     budget = get_budget(conn, parsed["category"])
     if budget:
-        cycle_total = get_cycle_total(conn, parsed["category"], budget["cycle_start_day"])
+        cycle_total = get_cycle_total(
+            conn, parsed["category"], budget["cycle_anchor"], budget["cycle_length_days"]
+        )
 
     reply = f"Logged: {parsed['merchant']} — ${parsed['amount']:.2f} ({parsed['category']})"
     if budget:
-        reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['monthly_limit']:.2f} this cycle."
-        if cycle_total > budget["monthly_limit"]:
-            reply += overspend_tail(cycle_total - budget["monthly_limit"])
+        reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this cycle."
+        if cycle_total > budget["cycle_limit"]:
+            reply += overspend_tail(cycle_total - budget["cycle_limit"])
     else:
         reply += "\n(no budget set for this category)"
 

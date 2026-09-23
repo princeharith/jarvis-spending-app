@@ -83,7 +83,7 @@ def get_going_out_budget_headroom(conn) -> float:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT category, monthly_limit, cycle_start_day
+            SELECT category, cycle_limit, cycle_anchor, cycle_length_days
             FROM budgets WHERE category = ANY(%s)
             """,
             (list(GOING_OUT_CATEGORIES),),
@@ -91,24 +91,24 @@ def get_going_out_budget_headroom(conn) -> float:
         budgets = cur.fetchall()
 
         remaining_total = 0.0
-        for category, monthly_limit, cycle_start_day in budgets:
+        for category, cycle_limit, cycle_anchor, cycle_length_days in budgets:
             cur.execute(
                 """
                 WITH bounds AS (
-                    SELECT CASE
-                        WHEN EXTRACT(DAY FROM now()) >= %(csd)s
-                            THEN date_trunc('month', now()) + (%(csd)s - 1) * INTERVAL '1 day'
-                        ELSE date_trunc('month', now() - INTERVAL '1 month') + (%(csd)s - 1) * INTERVAL '1 day'
-                    END AS cycle_start
+                    SELECT (
+                        %(anchor)s::date + (
+                            ((CURRENT_DATE - %(anchor)s::date) / %(length)s::int) * %(length)s::int
+                        ) * INTERVAL '1 day'
+                    )::timestamptz AS cycle_start
                 )
                 SELECT COALESCE(SUM(amount), 0)
                 FROM transactions, bounds
                 WHERE category = %(category)s AND logged_at >= bounds.cycle_start
                 """,
-                {"csd": cycle_start_day, "category": category},
+                {"anchor": cycle_anchor, "length": cycle_length_days, "category": category},
             )
             (cycle_total,) = cur.fetchone()
-            remaining_total += float(monthly_limit) - float(cycle_total)
+            remaining_total += float(cycle_limit) - float(cycle_total)
     return remaining_total
 
 
