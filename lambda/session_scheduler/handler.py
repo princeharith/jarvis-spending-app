@@ -22,7 +22,7 @@ DB_PASSWORD = os.environ["DB_PASSWORD"]
 CHECKIN_INTERVAL_MINUTES = 45
 WIND_DOWN_HOURS = 5
 MAX_SESSION_HOURS = 6
-GOING_OUT_CATEGORIES = ("food", "entertainment", "shopping")
+GOING_OUT_CATEGORIES = ("food_drink",)
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -78,9 +78,8 @@ def refresh_session_total(conn, session_id: int) -> float:
 
 
 def get_going_out_budget_headroom(conn) -> float:
-    # Loose proxy for "budget remaining for a night out": combined remaining
-    # this cycle across food/entertainment/shopping. Just context for the LLM's
-    # tone, not an exact per-session allowance.
+    # Loose proxy for "budget remaining for a night out": remaining food_drink
+    # budget this cycle. Just context for the LLM's tone, not an exact allowance.
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -146,7 +145,7 @@ def generate_checkin_message(
         f"- Out for {hours_elapsed:.1f} hours so far\n"
         f"- Spent ${running_total:.2f} tonight (~${pace_per_hour:.2f}/hour pace)\n"
         f"{target_line}"
-        f"- Remaining budget headroom this month across food/entertainment/shopping: ${budget_headroom:.2f}\n\n"
+        f"- Remaining food_drink budget headroom this month: ${budget_headroom:.2f}\n\n"
         "Tone rules: serious and direct, never jokey or cutesy. NEVER use emoji, not even one. "
         "If they're over or close to their stated target, spending fast relative to elapsed "
         "time, or budget headroom is low/negative, be blunt about it and use profanity (e.g. "

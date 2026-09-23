@@ -19,7 +19,7 @@ DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
 LOCAL_TZ = ZoneInfo("America/New_York")
-MEAL_CATEGORIES = ("food", "groceries")
+MEAL_CATEGORIES = ("food_drink", "groceries")
 
 # Each meal's window is [window_start_hour, now) local time on the day the check runs.
 MEAL_WINDOWS = {

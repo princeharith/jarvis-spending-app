@@ -18,7 +18,8 @@ DB_NAME = os.environ.get("DB_NAME", "jarvis")
 DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
-CATEGORIES = ["food", "coffee", "groceries", "transport", "entertainment", "shopping", "other"]
+CATEGORIES = ["food_drink", "groceries", "transport", "other"]
+TRACKED_CATEGORIES = {"food_drink", "groceries", "transport"}
 LOW_CONFIDENCE_THRESHOLD = 0.5
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -46,7 +47,13 @@ LOG_PURCHASE_TOOL = {
             "category": {
                 "type": "string",
                 "enum": CATEGORIES,
-                "description": "Best-fit spending category.",
+                "description": (
+                    "Best-fit category. 'food_drink' covers meals, snacks, coffee, and "
+                    "drinks/alcohol (including going-out spend). 'groceries' and 'transport' "
+                    "are literal. Use 'other' for anything that isn't one of those three "
+                    "(e.g. shopping, entertainment, subscriptions) — it still needs a merchant "
+                    "and amount, it just won't be logged."
+                ),
             },
             "confidence": {
                 "type": "number",
@@ -392,6 +399,14 @@ def handle_log_purchase(conn, chat_id, text, parsed):
         )
         send_telegram_message(chat_id, reply)
         return _ok("clarification requested")
+
+    if parsed["category"] not in TRACKED_CATEGORIES:
+        send_telegram_message(
+            chat_id,
+            f"Not tracking {parsed['category']} purchases right now "
+            f"(just food_drink, groceries, and transport).",
+        )
+        return _ok("category not tracked")
 
     session = get_active_session(conn)
     session_id = session["id"] if session else None
