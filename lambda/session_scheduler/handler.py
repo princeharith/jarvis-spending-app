@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import timedelta
+from datetime import datetime, timezone
 from urllib import request as urlrequest
 
 import psycopg2
@@ -20,10 +20,15 @@ DB_USER = os.environ["DB_USER"]
 DB_PASSWORD = os.environ["DB_PASSWORD"]
 
 CHECKIN_INTERVAL_MINUTES = 45
+WIND_DOWN_HOURS = 5
 MAX_SESSION_HOURS = 6
 GOING_OUT_CATEGORIES = ("food", "entertainment", "shopping")
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def overspend_tail(over_by: float) -> str:
+    return f" That's ${over_by:.2f} over. Cut it the fuck out."
 
 
 def get_db_connection():
@@ -36,11 +41,12 @@ def get_active_sessions(conn):
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT id, started_at, last_checkin_at, running_total,
+            SELECT id, started_at, last_checkin_at, running_total, target_amount,
+                   wind_down_nudge_sent,
                    EXTRACT(EPOCH FROM (now() - started_at)) / 3600.0 AS hours_elapsed,
                    EXTRACT(EPOCH FROM (now() - last_checkin_at)) / 60.0 AS minutes_since_checkin
             FROM sessions
-            WHERE status = 'active'
+            WHERE status IN ('awaiting_target', 'active')
             """
         )
         rows = cur.fetchall()
@@ -50,8 +56,10 @@ def get_active_sessions(conn):
             "started_at": r[1],
             "last_checkin_at": r[2],
             "running_total": float(r[3]),
-            "hours_elapsed": float(r[4]),
-            "minutes_since_checkin": float(r[5]),
+            "target_amount": float(r[4]) if r[4] is not None else None,
+            "wind_down_nudge_sent": r[5],
+            "hours_elapsed": float(r[6]),
+            "minutes_since_checkin": float(r[7]),
         }
         for r in rows
     ]
@@ -117,20 +125,33 @@ def touch_checkin(conn, session_id: int) -> None:
     conn.commit()
 
 
-def generate_checkin_message(hours_elapsed: float, running_total: float, budget_headroom: float) -> str:
+def mark_wind_down_sent(conn, session_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE sessions SET wind_down_nudge_sent = true WHERE id = %s", (session_id,))
+    conn.commit()
+
+
+def generate_checkin_message(
+    hours_elapsed: float, running_total: float, budget_headroom: float, target_amount
+) -> str:
     pace_per_hour = running_total / hours_elapsed if hours_elapsed > 0 else running_total
+    target_line = (
+        f"- Target for tonight: ${target_amount:.2f}\n" if target_amount is not None else ""
+    )
     prompt = (
-        "You're Jarvis, a friendly personal-finance texting assistant checking in on the user "
-        "mid-way through a night out. Write ONE short, casual text message (1-2 sentences max, "
-        "no more) asking how the night's going and prompting them to text you what they've spent "
-        "if they haven't logged it yet.\n\n"
+        "You're Jarvis, a personal-finance texting assistant checking in on the user mid-way "
+        "through a night out. Write ONE short text message (1-2 sentences max) asking how the "
+        "night's going and prompting them to text you what they've spent if they haven't logged it.\n\n"
         f"Session state:\n"
         f"- Out for {hours_elapsed:.1f} hours so far\n"
         f"- Spent ${running_total:.2f} tonight (~${pace_per_hour:.2f}/hour pace)\n"
+        f"{target_line}"
         f"- Remaining budget headroom this month across food/entertainment/shopping: ${budget_headroom:.2f}\n\n"
-        "Vary your tone with the state: light and casual if spending is modest and there's plenty "
-        "of headroom; a bit more direct (but still friendly, never preachy or alarmist) if they're "
-        "spending fast or headroom is low or negative. Use at most one emoji, or none. "
+        "Tone rules: serious and direct, never jokey or cutesy. NEVER use emoji, not even one. "
+        "If they're over or close to their stated target, spending fast relative to elapsed "
+        "time, or budget headroom is low/negative, be blunt about it and use profanity (e.g. "
+        "'fuck', 'shit') to make the point land — don't soften it. If spending is modest and "
+        "there's plenty of headroom, stay serious but neutral, no profanity needed. "
         "Output only the message text, nothing else."
     )
     response = anthropic_client.messages.create(
@@ -151,35 +172,121 @@ def send_telegram_message(text: str) -> None:
         resp.read()
 
 
+def process_sessions(conn):
+    sessions = get_active_sessions(conn)
+    results = []
+
+    for session in sessions:
+        if session["hours_elapsed"] >= MAX_SESSION_HOURS:
+            total = refresh_session_total(conn, session["id"])
+            end_session(conn, session["id"])
+            msg = f"Auto-ended your going-out session after {MAX_SESSION_HOURS} hours. Total spent: ${total:.2f}."
+            if session["target_amount"] is not None and total > session["target_amount"]:
+                msg += overspend_tail(total - session["target_amount"])
+            send_telegram_message(msg)
+            results.append({"session_id": session["id"], "action": "timed_out"})
+            continue
+
+        if session["hours_elapsed"] >= WIND_DOWN_HOURS and not session["wind_down_nudge_sent"]:
+            total = refresh_session_total(conn, session["id"])
+            msg = "5 hours in — are you home or done for the night? Text 'heading home' to close this out."
+            if session["target_amount"] is not None and total > session["target_amount"]:
+                msg += overspend_tail(total - session["target_amount"])
+            send_telegram_message(msg)
+            mark_wind_down_sent(conn, session["id"])
+            results.append({"session_id": session["id"], "action": "wind_down_nudge"})
+            continue
+
+        if session["minutes_since_checkin"] < CHECKIN_INTERVAL_MINUTES:
+            results.append({"session_id": session["id"], "action": "not_due"})
+            continue
+
+        total = refresh_session_total(conn, session["id"])
+        headroom = get_going_out_budget_headroom(conn)
+        message = generate_checkin_message(
+            session["hours_elapsed"], total, headroom, session["target_amount"]
+        )
+        send_telegram_message(message)
+        touch_checkin(conn, session["id"])
+        results.append({"session_id": session["id"], "action": "checked_in"})
+
+    return results
+
+
+def get_open_trackers(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, target_amount, starts_at, ends_at, over_target_notified,
+                   COALESCE((
+                       SELECT SUM(amount) FROM transactions
+                       WHERE logged_at >= t.starts_at AND logged_at <= LEAST(now(), t.ends_at)
+                   ), 0) AS spent
+            FROM trackers t
+            WHERE status = 'active'
+            """
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": r[0],
+            "target_amount": float(r[1]),
+            "starts_at": r[2],
+            "ends_at": r[3],
+            "over_target_notified": r[4],
+            "spent": float(r[5]),
+        }
+        for r in rows
+    ]
+
+
+def close_tracker(conn, tracker_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE trackers SET status = 'ended' WHERE id = %s", (tracker_id,))
+    conn.commit()
+
+
+def mark_tracker_notified(conn, tracker_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE trackers SET over_target_notified = true WHERE id = %s", (tracker_id,))
+    conn.commit()
+
+
+def process_trackers(conn):
+    results = []
+    now = datetime.now(timezone.utc)
+
+    for tracker in get_open_trackers(conn):
+        if now >= tracker["ends_at"]:
+            msg = f"Tracker done: spent ${tracker['spent']:.2f} of your ${tracker['target_amount']:.2f} target."
+            if tracker["spent"] > tracker["target_amount"]:
+                msg += overspend_tail(tracker["spent"] - tracker["target_amount"])
+            else:
+                msg += " Stayed under."
+            send_telegram_message(msg)
+            close_tracker(conn, tracker["id"])
+            results.append({"tracker_id": tracker["id"], "action": "closed"})
+            continue
+
+        if tracker["spent"] > tracker["target_amount"] and not tracker["over_target_notified"]:
+            msg = f"Tracker alert: spent ${tracker['spent']:.2f}, over your ${tracker['target_amount']:.2f} target."
+            msg += overspend_tail(tracker["spent"] - tracker["target_amount"])
+            send_telegram_message(msg)
+            mark_tracker_notified(conn, tracker["id"])
+            results.append({"tracker_id": tracker["id"], "action": "over_target_notified"})
+            continue
+
+        results.append({"tracker_id": tracker["id"], "action": "not_due"})
+
+    return results
+
+
 def lambda_handler(event, context):
     conn = get_db_connection()
     try:
-        sessions = get_active_sessions(conn)
-        results = []
-
-        for session in sessions:
-            if session["hours_elapsed"] >= MAX_SESSION_HOURS:
-                total = refresh_session_total(conn, session["id"])
-                end_session(conn, session["id"])
-                send_telegram_message(
-                    f"Auto-ending your going-out session after {MAX_SESSION_HOURS} hours — "
-                    f"hope it was a good night! Total spent: ${total:.2f}."
-                )
-                results.append({"session_id": session["id"], "action": "timed_out"})
-                continue
-
-            if session["minutes_since_checkin"] < CHECKIN_INTERVAL_MINUTES:
-                results.append({"session_id": session["id"], "action": "not_due"})
-                continue
-
-            total = refresh_session_total(conn, session["id"])
-            headroom = get_going_out_budget_headroom(conn)
-            message = generate_checkin_message(session["hours_elapsed"], total, headroom)
-            send_telegram_message(message)
-            touch_checkin(conn, session["id"])
-            results.append({"session_id": session["id"], "action": "checked_in"})
-
-        logger.info("Processed %d active session(s): %s", len(sessions), results)
-        return {"processed": results}
+        session_results = process_sessions(conn)
+        tracker_results = process_trackers(conn)
+        logger.info("Sessions: %s | Trackers: %s", session_results, tracker_results)
+        return {"sessions": session_results, "trackers": tracker_results}
     finally:
         conn.close()

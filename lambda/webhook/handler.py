@@ -23,6 +23,12 @@ LOW_CONFIDENCE_THRESHOLD = 0.5
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+
+def overspend_tail(over_by: float) -> str:
+    # Blunt on purpose — only ever appended when actually over a budget/target.
+    return f" That's ${over_by:.2f} over. Cut it the fuck out."
+
+
 LOG_PURCHASE_TOOL = {
     "name": "log_purchase",
     "description": "Extract structured purchase details from a message describing something the user bought or spent money on.",
@@ -58,7 +64,19 @@ START_SESSION_TOOL = {
         "want Jarvis to start tracking a going-out session with periodic check-ins "
         "(e.g. 'I'm going out', 'heading out tonight', 'going out with friends')."
     ),
-    "input_schema": {"type": "object", "properties": {}},
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "target_amount": {
+                "type": "number",
+                "description": (
+                    "The dollar spending target for the night, ONLY if the user stated one "
+                    "in this same message (e.g. 'going out, planning to spend 100' -> 100). "
+                    "Omit this field entirely if no amount was mentioned."
+                ),
+            }
+        },
+    },
 }
 
 END_SESSION_TOOL = {
@@ -71,16 +89,54 @@ END_SESSION_TOOL = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
-ALL_TOOLS = [LOG_PURCHASE_TOOL, START_SESSION_TOOL, END_SESSION_TOOL]
+SET_TARGET_TOOL = {
+    "name": "set_going_out_target",
+    "description": (
+        "The user was just asked how much they're planning to spend during their current "
+        "going-out session, and this message is their answer — a bare dollar figure with no "
+        "named merchant (e.g. '100', '$150', 'like 80 bucks'). Call this to record that target."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "target_amount": {"type": "number", "description": "The dollar target stated."},
+        },
+        "required": ["target_amount"],
+    },
+}
+
+SET_TRACKER_TOOL = {
+    "name": "set_spending_tracker",
+    "description": (
+        "Call this when the user wants to set an arbitrary spending cap for a time window "
+        "unrelated to a going-out session or the monthly category budgets, e.g. "
+        "'I want to spend $200 in the next 8 hours', 'cap it at $50 for the next 3 hours'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "target_amount": {"type": "number", "description": "The dollar cap stated."},
+            "duration_hours": {
+                "type": "number",
+                "description": "How many hours the cap applies for, as stated or implied.",
+            },
+        },
+        "required": ["target_amount", "duration_hours"],
+    },
+}
 
 
-def classify_message(raw_text: str):
+def classify_message(raw_text: str, awaiting_target: bool):
     """Returns (tool_name, tool_input) for the best-matching intent, or (None, None)
-    if the message doesn't clearly match logging a purchase or a session command."""
+    if the message doesn't clearly match any known intent."""
+    tools = [LOG_PURCHASE_TOOL, START_SESSION_TOOL, END_SESSION_TOOL, SET_TRACKER_TOOL]
+    if awaiting_target:
+        tools.append(SET_TARGET_TOOL)
+
     response = anthropic_client.messages.create(
         model="claude-sonnet-5",
         max_tokens=256,
-        tools=ALL_TOOLS,
+        tools=tools,
         tool_choice={"type": "auto"},
         messages=[{"role": "user", "content": raw_text}],
     )
@@ -154,22 +210,42 @@ def get_cycle_total(conn, category: str, cycle_start_day: int) -> float:
 def get_active_session(conn):
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, started_at, running_total FROM sessions WHERE status = 'active' LIMIT 1"
+            """
+            SELECT id, started_at, status, target_amount, running_total
+            FROM sessions WHERE status IN ('awaiting_target', 'active') LIMIT 1
+            """
         )
         row = cur.fetchone()
     if row is None:
         return None
-    return {"id": row[0], "started_at": row[1], "running_total": float(row[2])}
+    return {
+        "id": row[0],
+        "started_at": row[1],
+        "status": row[2],
+        "target_amount": float(row[3]) if row[3] is not None else None,
+        "running_total": float(row[4]),
+    }
 
 
-def start_session(conn) -> int:
+def start_session(conn, target_amount=None) -> int:
+    status = "active" if target_amount is not None else "awaiting_target"
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO sessions (status) VALUES ('active') RETURNING id"
+            "INSERT INTO sessions (status, target_amount) VALUES (%s, %s) RETURNING id",
+            (status, target_amount),
         )
         (session_id,) = cur.fetchone()
     conn.commit()
     return session_id
+
+
+def set_session_target(conn, session_id: int, target_amount: float) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE sessions SET target_amount = %s, status = 'active' WHERE id = %s",
+            (target_amount, session_id),
+        )
+    conn.commit()
 
 
 def end_session(conn, session_id: int) -> float:
@@ -196,6 +272,40 @@ def refresh_session_total(conn, session_id: int) -> float:
     return float(total)
 
 
+def create_tracker(conn, target_amount: float, duration_hours: float) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO trackers (target_amount, ends_at)
+            VALUES (%s, now() + (%s || ' hours')::interval)
+            """,
+            (target_amount, duration_hours),
+        )
+    conn.commit()
+
+
+def get_active_trackers(conn):
+    # Live-computed against logged_at falling in the window — trackers don't tag
+    # transactions, so they can overlap each other or a going-out session freely.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.id, t.target_amount, t.ends_at,
+                   COALESCE((
+                       SELECT SUM(amount) FROM transactions
+                       WHERE logged_at >= t.starts_at AND logged_at <= now()
+                   ), 0) AS spent
+            FROM trackers t
+            WHERE t.status = 'active' AND t.ends_at > now()
+            """
+        )
+        rows = cur.fetchall()
+    return [
+        {"id": r[0], "target_amount": float(r[1]), "ends_at": r[2], "spent": float(r[3])}
+        for r in rows
+    ]
+
+
 def send_telegram_message(chat_id, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
@@ -210,22 +320,34 @@ def _ok(body: str = "ok"):
     return {"statusCode": 200, "body": body}
 
 
-def handle_start_session(conn, chat_id):
+def handle_start_session(conn, chat_id, target_amount=None):
     existing = get_active_session(conn)
     if existing:
         send_telegram_message(
             chat_id,
-            f"You're already out — tracking since {existing['started_at']:%-I:%M %p} "
+            f"Already tracking a going-out session, started {existing['started_at']:%-I:%M %p} "
             f"(${existing['running_total']:.2f} so far).",
         )
         return _ok("session already active")
 
-    start_session(conn)
-    send_telegram_message(
-        chat_id,
-        "Have fun! I'll check in roughly every 45 min — text me what you're spending as you go.",
-    )
+    start_session(conn, target_amount=target_amount)
+    if target_amount is not None:
+        send_telegram_message(
+            chat_id,
+            f"Going-out session started. Target: ${target_amount:.2f}. "
+            "I'll check in roughly every 45 minutes.",
+        )
+    else:
+        send_telegram_message(chat_id, "Going-out session started. How much are you planning to spend tonight?")
     return _ok("session started")
+
+
+def handle_set_target(conn, chat_id, session, target_amount):
+    set_session_target(conn, session["id"], target_amount)
+    send_telegram_message(
+        chat_id, f"Target set: ${target_amount:.2f}. I'll flag it if you're pacing over that."
+    )
+    return _ok("target set")
 
 
 def handle_end_session(conn, chat_id):
@@ -235,15 +357,28 @@ def handle_end_session(conn, chat_id):
         return _ok("no active session")
 
     total = end_session(conn, session["id"])
-    elapsed = None
     with conn.cursor() as cur:
         cur.execute("SELECT now() - started_at FROM sessions WHERE id = %s", (session["id"],))
         (elapsed,) = cur.fetchone()
     hours = elapsed.total_seconds() / 3600
-    send_telegram_message(
-        chat_id, f"Welcome home! Spent ${total:.2f} over {hours:.1f} hours tonight."
-    )
+
+    reply = f"Session ended. Spent ${total:.2f} over {hours:.1f} hours."
+    if session["target_amount"] is not None:
+        if total > session["target_amount"]:
+            reply += overspend_tail(total - session["target_amount"])
+        else:
+            reply += f" Target was ${session['target_amount']:.2f} — stayed under."
+
+    send_telegram_message(chat_id, reply)
     return _ok("session ended")
+
+
+def handle_set_tracker(conn, chat_id, target_amount, duration_hours):
+    create_tracker(conn, target_amount, duration_hours)
+    send_telegram_message(
+        chat_id, f"Tracking ${target_amount:.2f} over the next {duration_hours:g} hours."
+    )
+    return _ok("tracker set")
 
 
 def handle_log_purchase(conn, chat_id, text, parsed):
@@ -251,10 +386,9 @@ def handle_log_purchase(conn, chat_id, text, parsed):
         # Don't guess-log an ambiguous parse — ask for clarification instead.
         # The user just resends a clearer message, which gets parsed fresh.
         reply = (
-            f"Not sure I got that right — best guess: {parsed['merchant']}, "
+            f"Not sure that parsed right — best guess: {parsed['merchant']}, "
             f"${parsed['amount']:.2f}, {parsed['category']} "
-            f"({parsed['confidence']:.0%} confidence). "
-            "Mind resending with the merchant and amount spelled out?"
+            f"({parsed['confidence']:.0%} confidence). Resend with the merchant and amount spelled out."
         )
         send_telegram_message(chat_id, reply)
         return _ok("clarification requested")
@@ -269,15 +403,22 @@ def handle_log_purchase(conn, chat_id, text, parsed):
 
     reply = f"Logged: {parsed['merchant']} — ${parsed['amount']:.2f} ({parsed['category']})"
     if budget:
-        reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['monthly_limit']:.2f} this cycle"
+        reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['monthly_limit']:.2f} this cycle."
         if cycle_total > budget["monthly_limit"]:
-            reply += " — over budget"
+            reply += overspend_tail(cycle_total - budget["monthly_limit"])
     else:
         reply += "\n(no budget set for this category)"
 
     if session_id:
         session_total = refresh_session_total(conn, session_id)
         reply += f"\nGoing out total: ${session_total:.2f}"
+        if session["target_amount"] is not None and session_total > session["target_amount"]:
+            reply += overspend_tail(session_total - session["target_amount"])
+
+    for tracker in get_active_trackers(conn):
+        reply += f"\nTracker: ${tracker['spent']:.2f}/${tracker['target_amount']:.2f}"
+        if tracker["spent"] > tracker["target_amount"]:
+            reply += overspend_tail(tracker["spent"] - tracker["target_amount"])
 
     send_telegram_message(chat_id, reply)
     return _ok()
@@ -300,22 +441,31 @@ def lambda_handler(event, context):
             # Non-text message (photo, sticker, etc.) or malformed update — nothing to log.
             return _ok("ignored")
 
-        tool_name, tool_input = classify_message(text)
-
-        if tool_name is None:
-            send_telegram_message(
-                chat_id,
-                "Didn't catch a purchase or a going-out update in that — "
-                "try something like 'Chipotle $14' or 'I'm going out'.",
-            )
-            return _ok("unrecognized")
-
         conn = get_db_connection()
         try:
+            session = get_active_session(conn)
+            awaiting_target = bool(session and session["status"] == "awaiting_target")
+
+            tool_name, tool_input = classify_message(text, awaiting_target)
+
+            if tool_name is None:
+                send_telegram_message(
+                    chat_id,
+                    "Didn't recognize that as a purchase, a going-out update, or a tracker. "
+                    "Try 'Chipotle $14', 'I'm going out', or 'spend $200 in the next 8 hours'.",
+                )
+                return _ok("unrecognized")
+
             if tool_name == "start_going_out_session":
-                return handle_start_session(conn, chat_id)
+                return handle_start_session(conn, chat_id, tool_input.get("target_amount"))
+            elif tool_name == "set_going_out_target":
+                return handle_set_target(conn, chat_id, session, tool_input["target_amount"])
             elif tool_name == "end_going_out_session":
                 return handle_end_session(conn, chat_id)
+            elif tool_name == "set_spending_tracker":
+                return handle_set_tracker(
+                    conn, chat_id, tool_input["target_amount"], tool_input["duration_hours"]
+                )
             else:
                 return handle_log_purchase(conn, chat_id, text, tool_input)
         finally:
