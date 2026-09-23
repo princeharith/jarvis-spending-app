@@ -2,7 +2,6 @@ import base64
 import json
 import logging
 import os
-from datetime import datetime, timezone
 from urllib import request as urlrequest
 
 import psycopg2
@@ -93,17 +92,37 @@ def insert_transaction(conn, raw_text: str, parsed: dict) -> None:
     conn.commit()
 
 
-def get_month_total(conn, category: str) -> float:
-    # Running total is scoped to the current calendar month across all categories,
-    # not just the category just logged — more useful for an at-a-glance reply than a
-    # single-category total. Budget-per-category totals land in Phase 2.
+def get_budget(conn, category: str):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT monthly_limit, cycle_start_day FROM budgets WHERE category = %s",
+            (category,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {"monthly_limit": float(row[0]), "cycle_start_day": row[1]}
+
+
+def get_cycle_total(conn, category: str, cycle_start_day: int) -> float:
+    # Cycle start: cycle_start_day of this month if we've reached it, else
+    # cycle_start_day of last month. Computed in SQL against the DB's own clock
+    # so it stays consistent regardless of Lambda's clock.
     with conn.cursor() as cur:
         cur.execute(
             """
+            WITH bounds AS (
+                SELECT CASE
+                    WHEN EXTRACT(DAY FROM now()) >= %(csd)s
+                        THEN date_trunc('month', now()) + (%(csd)s - 1) * INTERVAL '1 day'
+                    ELSE date_trunc('month', now() - INTERVAL '1 month') + (%(csd)s - 1) * INTERVAL '1 day'
+                END AS cycle_start
+            )
             SELECT COALESCE(SUM(amount), 0)
-            FROM transactions
-            WHERE date_trunc('month', logged_at) = date_trunc('month', now())
-            """
+            FROM transactions, bounds
+            WHERE category = %(category)s AND logged_at >= bounds.cycle_start
+            """,
+            {"csd": cycle_start_day, "category": category},
         )
         (total,) = cur.fetchone()
     return float(total)
@@ -140,23 +159,36 @@ def lambda_handler(event, context):
             # Non-text message (photo, sticker, etc.) or malformed update — nothing to log.
             return _ok("ignored")
 
-        # TODO(Phase 2): on low-confidence parses, reply asking the user to clarify
-        # (e.g. "did you mean $14 at Chipotle?") instead of logging a guess.
         parsed = parse_purchase(text)
+
+        if parsed["confidence"] < LOW_CONFIDENCE_THRESHOLD:
+            # Don't guess-log an ambiguous parse — ask for clarification instead.
+            # The user just resends a clearer message, which gets parsed fresh.
+            reply = (
+                f"Not sure I got that right — best guess: {parsed['merchant']}, "
+                f"${parsed['amount']:.2f}, {parsed['category']} "
+                f"({parsed['confidence']:.0%} confidence). "
+                "Mind resending with the merchant and amount spelled out?"
+            )
+            send_telegram_message(chat_id, reply)
+            return _ok("clarification requested")
 
         conn = get_db_connection()
         try:
             insert_transaction(conn, text, parsed)
-            month_total = get_month_total(conn, parsed["category"])
+            budget = get_budget(conn, parsed["category"])
+            if budget:
+                cycle_total = get_cycle_total(conn, parsed["category"], budget["cycle_start_day"])
         finally:
             conn.close()
 
-        reply = (
-            f"Logged: {parsed['merchant']} — ${parsed['amount']:.2f} ({parsed['category']})\n"
-            f"Month total: ${month_total:.2f}"
-        )
-        if parsed["confidence"] < LOW_CONFIDENCE_THRESHOLD:
-            reply += "\n(low confidence parse — reply to correct it if that's wrong)"
+        reply = f"Logged: {parsed['merchant']} — ${parsed['amount']:.2f} ({parsed['category']})"
+        if budget:
+            reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['monthly_limit']:.2f} this cycle"
+            if cycle_total > budget["monthly_limit"]:
+                reply += " — over budget"
+        else:
+            reply += "\n(no budget set for this category)"
 
         send_telegram_message(chat_id, reply)
         return _ok()
