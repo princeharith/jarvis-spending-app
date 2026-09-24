@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import random
 from urllib import request as urlrequest
 
 import psycopg2
@@ -28,6 +29,25 @@ anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 def overspend_tail(over_by: float) -> str:
     # Blunt on purpose — only ever appended when actually over a budget/target.
     return f" That's ${over_by:.2f} over. Cut it the fuck out."
+
+
+# Casual "talking to a friend" openers for routine setup confirmations (setting a
+# budget/tracker/session/window) — kept separate from overspend_tail, which stays
+# serious. Not used for purchase logs, warnings, or query results.
+CASUAL_OPENERS = [
+    "Sure bro",
+    "You got it brotha",
+    "Say less",
+    "Bet, locked in",
+    "On it dawg",
+    "You got it chief",
+    "Done deal",
+    "Bet",
+]
+
+
+def casual_opener() -> str:
+    return random.choice(CASUAL_OPENERS)
 
 
 LOG_PURCHASE_TOOL = {
@@ -625,18 +645,21 @@ def handle_start_session(conn, chat_id, target_amount=None):
     if target_amount is not None:
         send_telegram_message(
             chat_id,
-            f"Going-out session started. Target: ${target_amount:.2f}. "
+            f"{casual_opener()}. Target's ${target_amount:.2f}, "
             "I'll check in roughly every 45 minutes.",
         )
     else:
-        send_telegram_message(chat_id, "Going-out session started. How much are you planning to spend tonight?")
+        send_telegram_message(
+            chat_id, f"{casual_opener()}, going-out mode on. How much are you planning to spend tonight?"
+        )
     return _ok("session started")
 
 
 def handle_set_target(conn, chat_id, session, target_amount):
     set_session_target(conn, session["id"], target_amount)
     send_telegram_message(
-        chat_id, f"Target set: ${target_amount:.2f}. I'll flag it if you're pacing over that."
+        chat_id,
+        f"{casual_opener()}, target's ${target_amount:.2f}. I'll flag it if you're pacing over that.",
     )
     return _ok("target set")
 
@@ -658,7 +681,7 @@ def handle_end_session(conn, chat_id):
         if total > session["target_amount"]:
             reply += overspend_tail(total - session["target_amount"])
         else:
-            reply += f" Target was ${session['target_amount']:.2f} — stayed under."
+            reply += f" Target was ${session['target_amount']:.2f}, stayed under."
 
     send_telegram_message(chat_id, reply)
     return _ok("session ended")
@@ -667,7 +690,8 @@ def handle_end_session(conn, chat_id):
 def handle_set_tracker(conn, chat_id, target_amount, duration_hours):
     create_tracker(conn, target_amount, duration_hours)
     send_telegram_message(
-        chat_id, f"Tracking ${target_amount:.2f} over the next {duration_hours:g} hours."
+        chat_id,
+        f"{casual_opener()}, tracking ${target_amount:.2f} over the next {duration_hours:g} hours.",
     )
     return _ok("tracker set")
 
@@ -706,11 +730,11 @@ def handle_start_budget_window(conn, chat_id, tool_input):
     create_budget_window(conn, duration_hours, limits)
 
     lines = [f"{category}: ${amount:.2f}" for category, amount in sorted(limits.items())]
-    reply = f"Budgeting window started for {duration_hours:g} hours:\n" + "\n".join(lines)
+    reply = f"{casual_opener()}. Budgeting window locked in for {duration_hours:g} hours:\n" + "\n".join(lines)
 
     missing = sorted(TRACKED_CATEGORIES - limits.keys())
     if missing:
-        reply += f"\nNo limit set for {', '.join(missing)} — let me know if you want to add one (fine to skip too)."
+        reply += f"\nNo limit set for {', '.join(missing)}. Let me know if you want to add one (fine to skip too)."
 
     send_telegram_message(chat_id, reply)
     return _ok("budget window started")
@@ -733,7 +757,9 @@ def handle_add_window_limit(conn, chat_id, category, limit_amount):
         )
     conn.commit()
 
-    send_telegram_message(chat_id, f"Added: {category} limit ${limit_amount:.2f} for this window.")
+    send_telegram_message(
+        chat_id, f"{casual_opener()}, added {category} limit ${limit_amount:.2f} for this window."
+    )
     return _ok("window limit added")
 
 
@@ -834,7 +860,7 @@ def handle_undo_last_purchase(conn, chat_id):
         return _ok("no transaction")
 
     delete_transaction(conn, last["id"])
-    reply = f"Removed: {last['merchant']} — ${last['amount']:.2f} ({last['category']})"
+    reply = f"Removed: {last['merchant']}, ${last['amount']:.2f} ({last['category']})"
 
     if last["session_id"]:
         session_total = refresh_session_total(conn, last["session_id"])
@@ -849,7 +875,7 @@ def handle_log_purchase(conn, chat_id, text, parsed):
         # Don't guess-log an ambiguous parse — ask for clarification instead.
         # The user just resends a clearer message, which gets parsed fresh.
         reply = (
-            f"Not sure that parsed right — best guess: {parsed['merchant']}, "
+            f"Not sure that parsed right, best guess: {parsed['merchant']}, "
             f"${parsed['amount']:.2f}, {parsed['category']} "
             f"({parsed['confidence']:.0%} confidence). Resend with the merchant and amount spelled out."
         )
@@ -872,7 +898,7 @@ def handle_log_purchase(conn, chat_id, text, parsed):
     if budget:
         cycle_total = get_cycle_total(conn, parsed["category"], budget)
 
-    reply = f"Logged: {parsed['merchant']} — ${parsed['amount']:.2f} ({parsed['category']})"
+    reply = f"Logged: {parsed['merchant']}, ${parsed['amount']:.2f} ({parsed['category']})"
     if budget:
         reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period."
         if cycle_total > budget["cycle_limit"]:

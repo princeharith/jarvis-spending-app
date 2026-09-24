@@ -162,9 +162,10 @@ def generate_checkin_message(
         f"{target_line}"
         f"- Remaining food_drink budget headroom this month: ${budget_headroom:.2f}\n\n"
         "Tone rules: serious and direct, never jokey or cutesy. NEVER use emoji, not even one. "
+        "NEVER use an em dash, use a period or comma instead. "
         "If they're over or close to their stated target, spending fast relative to elapsed "
         "time, or budget headroom is low/negative, be blunt about it and use profanity (e.g. "
-        "'fuck', 'shit') to make the point land — don't soften it. If spending is modest and "
+        "'fuck', 'shit') to make the point land, don't soften it. If spending is modest and "
         "there's plenty of headroom, stay serious but neutral, no profanity needed. "
         "Output only the message text, nothing else."
     )
@@ -203,7 +204,7 @@ def process_sessions(conn):
 
         if session["hours_elapsed"] >= WIND_DOWN_HOURS and not session["wind_down_nudge_sent"]:
             total = refresh_session_total(conn, session["id"])
-            msg = "5 hours in — are you home or done for the night? Text 'heading home' to close this out."
+            msg = "5 hours in. Are you home or done for the night? Text 'heading home' to close this out."
             if session["target_amount"] is not None and total > session["target_amount"]:
                 msg += overspend_tail(total - session["target_amount"])
             send_telegram_message(msg)
@@ -340,7 +341,7 @@ def process_budget_windows(conn):
                 (spent,) = cur.fetchone()
                 spent, limit_amount = float(spent), float(limit_amount)
                 line = f"{category}: ${spent:.2f}/${limit_amount:.2f}"
-                line += overspend_tail(spent - limit_amount) if spent > limit_amount else " — stayed under."
+                line += overspend_tail(spent - limit_amount) if spent > limit_amount else ", stayed under."
                 lines.append(line)
 
         send_telegram_message("Budgeting window done:\n" + "\n".join(lines))
