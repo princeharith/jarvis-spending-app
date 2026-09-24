@@ -260,6 +260,30 @@ CANCEL_BUDGET_WINDOW_TOOL = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
+SET_PAYCHECK_LIMIT_TOOL = {
+    "name": "set_paycheck_period_limit",
+    "description": (
+        "Call this when the user wants to change or reset a category's dollar limit for the "
+        "standing PAYCHECK PERIOD (the semimonthly 1st-15th / 16th-end-of-month budget) — "
+        "e.g. they made a mistake setting it up or just want a different number. NOT for a "
+        "budgeting window or tracker. E.g. 'change my food_drink paycheck limit to 300', "
+        "'reset my transport budget to 100', 'set groceries limit to 250 for the paycheck "
+        "period'."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "enum": sorted(TRACKED_CATEGORIES),
+                "description": "Which tracked category's paycheck-period limit to change.",
+            },
+            "new_limit": {"type": "number", "description": "The new dollar limit."},
+        },
+        "required": ["category", "new_limit"],
+    },
+}
+
 
 CORRECT_LAST_TOOL = {
     "name": "correct_last_purchase",
@@ -350,6 +374,7 @@ def classify_message(raw_text: str, awaiting_target: bool, window_active: bool, 
         build_start_budget_window_tool(window_pending),
         GET_BUDGET_WINDOW_STATUS_TOOL,
         CANCEL_BUDGET_WINDOW_TOOL,
+        SET_PAYCHECK_LIMIT_TOOL,
         ACKNOWLEDGE_NO_SPEND_TOOL,
         GREET_TOOL,
     ]
@@ -916,6 +941,17 @@ def handle_cancel_budget_window(conn, chat_id):
     return _ok("window cancelled")
 
 
+def handle_set_paycheck_limit(conn, chat_id, category, new_limit):
+    with conn.cursor() as cur:
+        cur.execute("UPDATE budgets SET cycle_limit = %s WHERE category = %s", (new_limit, category))
+    conn.commit()
+
+    send_telegram_message(
+        chat_id, f"{casual_opener()}, {category} paycheck period limit is now ${new_limit:.2f}."
+    )
+    return _ok("paycheck limit updated")
+
+
 def category_status_line(conn, category: str) -> str:
     budget = get_budget(conn, category)
     if not budget:
@@ -1112,6 +1148,8 @@ def lambda_handler(event, context):
                 return handle_get_budget_window_status(conn, chat_id)
             elif tool_name == "cancel_budget_window":
                 return handle_cancel_budget_window(conn, chat_id)
+            elif tool_name == "set_paycheck_period_limit":
+                return handle_set_paycheck_limit(conn, chat_id, tool_input["category"], tool_input["new_limit"])
             elif tool_name == "add_budget_window_category_limit":
                 return handle_add_window_limit(
                     conn, chat_id, tool_input["category"], tool_input["limit_amount"]
