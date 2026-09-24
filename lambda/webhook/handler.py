@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+from datetime import datetime, timezone
 from urllib import request as urlrequest
 
 import psycopg2
@@ -194,32 +195,48 @@ GET_CATEGORY_STATUS_TOOL = {
     },
 }
 
-START_BUDGET_WINDOW_TOOL = {
-    "name": "start_budget_window",
-    "description": (
-        "Call this when the user wants to start a new ad-hoc 'budgeting window' or 'budgeting "
-        "cycle' with per-category spending limits for some duration (a week, a weekend, 3 "
-        "days, etc.) — separate from the standing paycheck period. E.g. 'I want to start a "
-        "new budgeting cycle, food and drink $100, groceries $50, transport $30 for the next "
-        "week'. Give at least one category limit."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "duration_hours": {
-                "type": "number",
-                "description": (
-                    "How many hours the window lasts, as stated or implied "
-                    "(e.g. 'a week' -> 168, 'the weekend' -> 60, '3 days' -> 72)."
-                ),
+def build_start_budget_window_tool(window_pending: bool) -> dict:
+    pending_hint = (
+        (
+            "A budgeting window is currently PENDING (already started, still missing its "
+            "duration and/or category limits) — Jarvis just asked for those details. ALSO call "
+            "this for a short follow-up reply that answers that question, even a bare one like "
+            "'food and drink 125' or 'groceries 40, transport 20' or just 'a week' or 'till "
+            "October 1st' with no other context. "
+        )
+        if window_pending
+        else ""
+    )
+    return {
+        "name": "start_budget_window",
+        "description": (
+            "Call this when the user wants to start a new ad-hoc 'budgeting window' or "
+            "'budgeting cycle' with per-category spending limits for some duration (a week, a "
+            "weekend, 3 days, a specific date, etc.) — separate from the standing paycheck "
+            "period. E.g. 'I want to start a new budgeting cycle, food and drink $100, "
+            "groceries $50, transport $30 for the next week'. Also call this for a vaguer "
+            "intent to save/budget with no numbers yet, e.g. 'I need to save money for a "
+            "while' — just omit whatever fields weren't given, Jarvis will ask for the rest. "
+            f"{pending_hint}"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "duration_hours": {
+                    "type": "number",
+                    "description": (
+                        "How many hours the window lasts, as stated or implied (e.g. 'a week' "
+                        "-> 168, 'the weekend' -> 60, '3 days' -> 72). If an explicit end date "
+                        "is given instead (e.g. 'till October 1st'), compute the hours between "
+                        "today and that date. Omit if no duration or end date was given."
+                    ),
+                },
+                "food_drink_limit": {"type": "number", "description": "Window limit for food_drink, if stated."},
+                "groceries_limit": {"type": "number", "description": "Window limit for groceries, if stated."},
+                "transport_limit": {"type": "number", "description": "Window limit for transport, if stated."},
             },
-            "food_drink_limit": {"type": "number", "description": "Window limit for food_drink, if stated."},
-            "groceries_limit": {"type": "number", "description": "Window limit for groceries, if stated."},
-            "transport_limit": {"type": "number", "description": "Window limit for transport, if stated."},
         },
-        "required": ["duration_hours"],
-    },
-}
+    }
 
 GET_BUDGET_WINDOW_STATUS_TOOL = {
     "name": "get_budget_window_status",
@@ -286,18 +303,6 @@ GREET_TOOL = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
-REQUEST_BUDGET_WINDOW_DETAILS_TOOL = {
-    "name": "request_budget_window_details",
-    "description": (
-        "Call this when the user expresses a general intent to budget carefully or save "
-        "money for an upcoming period WITHOUT giving specific per-category dollar limits or "
-        "an exact duration, e.g. 'I need to save for the next few days', 'let's be careful "
-        "with spending this week', 'I want to budget better for a while'. If they already "
-        "gave concrete numbers and a duration, use start_budget_window instead."
-    ),
-    "input_schema": {"type": "object", "properties": {}},
-}
-
 ADD_WINDOW_LIMIT_TOOL = {
     "name": "add_budget_window_category_limit",
     "description": (
@@ -319,7 +324,7 @@ ADD_WINDOW_LIMIT_TOOL = {
 }
 
 
-def classify_message(raw_text: str, awaiting_target: bool, window_active: bool):
+def classify_message(raw_text: str, awaiting_target: bool, window_active: bool, window_pending: bool):
     """Returns (tool_name, tool_input) for the best-matching intent, or (None, None)
     if the message doesn't clearly match any known intent."""
     tools = [
@@ -331,10 +336,9 @@ def classify_message(raw_text: str, awaiting_target: bool, window_active: bool):
         GET_CATEGORY_STATUS_TOOL,
         CORRECT_LAST_TOOL,
         UNDO_LAST_TOOL,
-        START_BUDGET_WINDOW_TOOL,
+        build_start_budget_window_tool(window_pending),
         GET_BUDGET_WINDOW_STATUS_TOOL,
         ACKNOWLEDGE_NO_SPEND_TOOL,
-        REQUEST_BUDGET_WINDOW_DETAILS_TOOL,
         GREET_TOOL,
     ]
     if awaiting_target:
@@ -345,6 +349,7 @@ def classify_message(raw_text: str, awaiting_target: bool, window_active: bool):
     response = anthropic_client.messages.create(
         model="claude-sonnet-5",
         max_tokens=256,
+        system=f"Today's date is {datetime.now(timezone.utc):%Y-%m-%d}.",
         tools=tools,
         tool_choice={"type": "auto"},
         messages=[{"role": "user", "content": raw_text}],
@@ -586,20 +591,53 @@ def get_active_trackers(conn):
     ]
 
 
-def create_budget_window(conn, duration_hours: float, limits: dict) -> int:
+def create_pending_window(conn) -> int:
     with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO budget_windows (ends_at) VALUES (now() + (%s || ' hours')::interval) RETURNING id",
-            (duration_hours,),
-        )
+        cur.execute("INSERT INTO budget_windows (status) VALUES ('pending') RETURNING id")
         (window_id,) = cur.fetchone()
-        for category, limit_amount in limits.items():
-            cur.execute(
-                "INSERT INTO budget_window_limits (window_id, category, limit_amount) VALUES (%s, %s, %s)",
-                (window_id, category, limit_amount),
-            )
     conn.commit()
     return window_id
+
+
+def upsert_window_limit(conn, window_id: int, category: str, limit_amount: float) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO budget_window_limits (window_id, category, limit_amount)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (window_id, category) DO UPDATE SET limit_amount = EXCLUDED.limit_amount
+            """,
+            (window_id, category, limit_amount),
+        )
+    conn.commit()
+
+
+def set_window_duration(conn, window_id: int, duration_hours: float) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE budget_windows SET ends_at = starts_at + (%s || ' hours')::interval WHERE id = %s",
+            (duration_hours, window_id),
+        )
+    conn.commit()
+
+
+def finalize_window(conn, window_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE budget_windows SET status = 'active' WHERE id = %s", (window_id,))
+    conn.commit()
+
+
+def get_open_budget_window(conn):
+    # 'pending' (setup in progress) or 'active' (fully running) — the one-open-
+    # window-at-a-time state, mirroring sessions' awaiting_target/active pair.
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, status, starts_at, ends_at FROM budget_windows WHERE status IN ('pending', 'active') LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {"id": row[0], "status": row[1], "starts_at": row[2], "ends_at": row[3]}
 
 
 def get_active_budget_window(conn):
@@ -724,36 +762,68 @@ def window_category_line(conn, window, category: str, limit_amount: float) -> st
 
 
 def handle_start_budget_window(conn, chat_id, tool_input):
-    existing = get_active_budget_window(conn)
-    if existing:
+    open_window = get_open_budget_window(conn)
+    if open_window and open_window["status"] == "active":
         send_telegram_message(
             chat_id,
-            f"Already have a budgeting window running, ends {existing['ends_at']:%a %-I:%M %p}. "
+            f"Already have a budgeting window running, ends {open_window['ends_at']:%a %-I:%M %p}. "
             "End it first (just let it run out) before starting a new one.",
         )
         return _ok("window already active")
 
-    limits = {
+    # Either starting fresh, or filling in details on an already-pending window.
+    window_id = open_window["id"] if open_window else create_pending_window(conn)
+
+    new_limits = {
         category: tool_input[f"{category}_limit"]
         for category in TRACKED_CATEGORIES
         if tool_input.get(f"{category}_limit") is not None
     }
-    if not limits:
-        send_telegram_message(chat_id, "Give me at least one category limit to start a budgeting window.")
-        return _ok("no limits given")
+    for category, limit_amount in new_limits.items():
+        upsert_window_limit(conn, window_id, category, limit_amount)
 
-    duration_hours = tool_input["duration_hours"]
-    create_budget_window(conn, duration_hours, limits)
+    duration_hours = tool_input.get("duration_hours")
+    if duration_hours is not None:
+        set_window_duration(conn, window_id, duration_hours)
 
-    lines = [f"{category}: ${amount:.2f}" for category, amount in sorted(limits.items())]
-    reply = f"{casual_opener()}. Budgeting window locked in for {duration_hours:g} hours:\n" + "\n".join(lines)
+    current_limits = get_budget_window_limits(conn, window_id)
+    with conn.cursor() as cur:
+        cur.execute("SELECT ends_at FROM budget_windows WHERE id = %s", (window_id,))
+        (ends_at,) = cur.fetchone()
 
-    missing = sorted(TRACKED_CATEGORIES - limits.keys())
-    if missing:
-        reply += f"\nNo limit set for {', '.join(missing)}. Let me know if you want to add one (fine to skip too)."
+    if ends_at is not None and current_limits:
+        finalize_window(conn, window_id)
+        with conn.cursor() as cur:
+            cur.execute("SELECT starts_at FROM budget_windows WHERE id = %s", (window_id,))
+            (starts_at,) = cur.fetchone()
+        total_hours = (ends_at - starts_at).total_seconds() / 3600
 
+        lines = [f"{category}: ${amount:.2f}" for category, amount in sorted(current_limits.items())]
+        reply = f"{casual_opener()}. Budgeting window locked in for {total_hours:g} hours:\n" + "\n".join(lines)
+
+        missing = sorted(TRACKED_CATEGORIES - current_limits.keys())
+        if missing:
+            reply += f"\nNo limit set for {', '.join(missing)}. Let me know if you want to add one (fine to skip too)."
+
+        send_telegram_message(chat_id, reply)
+        return _ok("budget window started")
+
+    # Still missing something — ask only for what's actually missing.
+    still_need = []
+    if ends_at is None:
+        still_need.append("how long it should run (or an end date)")
+    if not current_limits:
+        still_need.append("at least one category limit (food_drink, groceries, transport)")
+
+    got = []
+    if new_limits:
+        got.append(", ".join(f"{c} ${a:.2f}" for c, a in sorted(new_limits.items())))
+    if duration_hours is not None:
+        got.append(f"{duration_hours:g} hours")
+
+    reply = f"Got it{': ' + '; '.join(got) if got else ''}. Still need {' and '.join(still_need)}."
     send_telegram_message(chat_id, reply)
-    return _ok("budget window started")
+    return _ok("budget window pending")
 
 
 def handle_add_window_limit(conn, chat_id, category, limit_amount):
@@ -762,16 +832,7 @@ def handle_add_window_limit(conn, chat_id, category, limit_amount):
         send_telegram_message(chat_id, "No active budgeting window to add a limit to.")
         return _ok("no active window")
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO budget_window_limits (window_id, category, limit_amount)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (window_id, category) DO UPDATE SET limit_amount = EXCLUDED.limit_amount
-            """,
-            (window["id"], category, limit_amount),
-        )
-    conn.commit()
+    upsert_window_limit(conn, window["id"], category, limit_amount)
 
     send_telegram_message(
         chat_id, f"{casual_opener()}, added {category} limit ${limit_amount:.2f} for this window."
@@ -800,14 +861,6 @@ GREETINGS = [
 def handle_greet(conn, chat_id):
     send_telegram_message(chat_id, random.choice(GREETINGS))
     return _ok("greeted")
-
-
-def handle_request_budget_window_details(conn, chat_id):
-    send_telegram_message(
-        chat_id,
-        "How long, and what's the limit for each category (food_drink, groceries, transport)?",
-    )
-    return _ok("asked for budget window details")
 
 
 def handle_get_budget_window_status(conn, chat_id):
@@ -984,9 +1037,11 @@ def lambda_handler(event, context):
         try:
             session = get_active_session(conn)
             awaiting_target = bool(session and session["status"] == "awaiting_target")
-            window_active = get_active_budget_window(conn) is not None
+            open_window = get_open_budget_window(conn)
+            window_active = bool(open_window and open_window["status"] == "active")
+            window_pending = bool(open_window and open_window["status"] == "pending")
 
-            tool_name, tool_input = classify_message(text, awaiting_target, window_active)
+            tool_name, tool_input = classify_message(text, awaiting_target, window_active, window_pending)
 
             if tool_name is None:
                 send_telegram_message(
@@ -1024,8 +1079,6 @@ def lambda_handler(event, context):
                 )
             elif tool_name == "acknowledge_no_spend":
                 return handle_acknowledge_no_spend(conn, chat_id)
-            elif tool_name == "request_budget_window_details":
-                return handle_request_budget_window_details(conn, chat_id)
             elif tool_name == "greet":
                 return handle_greet(conn, chat_id)
             else:
