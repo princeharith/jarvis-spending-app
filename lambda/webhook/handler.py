@@ -240,8 +240,51 @@ UNDO_LAST_TOOL = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
+ACKNOWLEDGE_NO_SPEND_TOOL = {
+    "name": "acknowledge_no_spend",
+    "description": (
+        "Call this when the user is simply telling Jarvis they haven't spent/bought/eaten "
+        "anything — not logging a purchase, not asking a question, not starting/ending "
+        "anything. Often a reply to a check-in nudge. E.g. 'I haven't eaten anything', "
+        "'nope, nothing today', 'no purchases', 'haven't gotten groceries yet'."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
 
-def classify_message(raw_text: str, awaiting_target: bool):
+REQUEST_BUDGET_WINDOW_DETAILS_TOOL = {
+    "name": "request_budget_window_details",
+    "description": (
+        "Call this when the user expresses a general intent to budget carefully or save "
+        "money for an upcoming period WITHOUT giving specific per-category dollar limits or "
+        "an exact duration, e.g. 'I need to save for the next few days', 'let's be careful "
+        "with spending this week', 'I want to budget better for a while'. If they already "
+        "gave concrete numbers and a duration, use start_budget_window instead."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+ADD_WINDOW_LIMIT_TOOL = {
+    "name": "add_budget_window_category_limit",
+    "description": (
+        "Call this ONLY when the user is explicitly adding/setting a spending LIMIT or CAP "
+        "for a category on their CURRENTLY ACTIVE budgeting window — using words like "
+        "'limit', 'cap', 'budget', or 'window' — not when they're logging an actual purchase. "
+        "E.g. 'add a groceries limit of 40 to the window', 'let's cap groceries at 40 too'. "
+        "A bare 'groceries 40' or 'spent 40 on groceries' with no limit/cap/window language "
+        "is a purchase — use log_purchase for that instead."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "category": {"type": "string", "enum": sorted(TRACKED_CATEGORIES)},
+            "limit_amount": {"type": "number"},
+        },
+        "required": ["category", "limit_amount"],
+    },
+}
+
+
+def classify_message(raw_text: str, awaiting_target: bool, window_active: bool):
     """Returns (tool_name, tool_input) for the best-matching intent, or (None, None)
     if the message doesn't clearly match any known intent."""
     tools = [
@@ -255,9 +298,13 @@ def classify_message(raw_text: str, awaiting_target: bool):
         UNDO_LAST_TOOL,
         START_BUDGET_WINDOW_TOOL,
         GET_BUDGET_WINDOW_STATUS_TOOL,
+        ACKNOWLEDGE_NO_SPEND_TOOL,
+        REQUEST_BUDGET_WINDOW_DETAILS_TOOL,
     ]
     if awaiting_target:
         tools.append(SET_TARGET_TOOL)
+    if window_active:
+        tools.append(ADD_WINDOW_LIMIT_TOOL)
 
     response = anthropic_client.messages.create(
         model="claude-sonnet-5",
@@ -660,8 +707,47 @@ def handle_start_budget_window(conn, chat_id, tool_input):
 
     lines = [f"{category}: ${amount:.2f}" for category, amount in sorted(limits.items())]
     reply = f"Budgeting window started for {duration_hours:g} hours:\n" + "\n".join(lines)
+
+    missing = sorted(TRACKED_CATEGORIES - limits.keys())
+    if missing:
+        reply += f"\nNo limit set for {', '.join(missing)} — let me know if you want to add one (fine to skip too)."
+
     send_telegram_message(chat_id, reply)
     return _ok("budget window started")
+
+
+def handle_add_window_limit(conn, chat_id, category, limit_amount):
+    window = get_active_budget_window(conn)
+    if not window:
+        send_telegram_message(chat_id, "No active budgeting window to add a limit to.")
+        return _ok("no active window")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO budget_window_limits (window_id, category, limit_amount)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (window_id, category) DO UPDATE SET limit_amount = EXCLUDED.limit_amount
+            """,
+            (window["id"], category, limit_amount),
+        )
+    conn.commit()
+
+    send_telegram_message(chat_id, f"Added: {category} limit ${limit_amount:.2f} for this window.")
+    return _ok("window limit added")
+
+
+def handle_acknowledge_no_spend(conn, chat_id):
+    send_telegram_message(chat_id, "Noted.")
+    return _ok("acknowledged")
+
+
+def handle_request_budget_window_details(conn, chat_id):
+    send_telegram_message(
+        chat_id,
+        "How long, and what's the limit for each category (food_drink, groceries, transport)?",
+    )
+    return _ok("asked for budget window details")
 
 
 def handle_get_budget_window_status(conn, chat_id):
@@ -838,8 +924,9 @@ def lambda_handler(event, context):
         try:
             session = get_active_session(conn)
             awaiting_target = bool(session and session["status"] == "awaiting_target")
+            window_active = get_active_budget_window(conn) is not None
 
-            tool_name, tool_input = classify_message(text, awaiting_target)
+            tool_name, tool_input = classify_message(text, awaiting_target, window_active)
 
             if tool_name is None:
                 send_telegram_message(
@@ -871,6 +958,14 @@ def lambda_handler(event, context):
                 return handle_start_budget_window(conn, chat_id, tool_input)
             elif tool_name == "get_budget_window_status":
                 return handle_get_budget_window_status(conn, chat_id)
+            elif tool_name == "add_budget_window_category_limit":
+                return handle_add_window_limit(
+                    conn, chat_id, tool_input["category"], tool_input["limit_amount"]
+                )
+            elif tool_name == "acknowledge_no_spend":
+                return handle_acknowledge_no_spend(conn, chat_id)
+            elif tool_name == "request_budget_window_details":
+                return handle_request_budget_window_details(conn, chat_id)
             else:
                 return handle_log_purchase(conn, chat_id, text, tool_input)
         finally:
