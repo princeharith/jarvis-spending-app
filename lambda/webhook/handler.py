@@ -779,7 +779,17 @@ def handle_acknowledge_no_spend(conn, chat_id):
     return _ok("acknowledged")
 
 
-GREETINGS = ["Yo", "Hey, what's up", "Sup", "What's good", "Hey"]
+GREETINGS = [
+    "Yo",
+    "Yooo",
+    "Hey, what's up",
+    "Sup",
+    "What's good",
+    "Hey",
+    "What's goodie fam",
+    "Ayo",
+    "Wassup",
+]
 
 
 def handle_greet(conn, chat_id):
