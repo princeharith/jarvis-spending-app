@@ -24,6 +24,14 @@ CATEGORIES = ["food_drink", "groceries", "transport", "other"]
 TRACKED_CATEGORIES = {"food_drink", "groceries", "transport"}
 LOW_CONFIDENCE_THRESHOLD = 0.5
 
+# "food_drink" is the stable internal category slug (DB storage, tool schema),
+# but reads better in a message as "food/drink".
+DISPLAY_CATEGORY = {"food_drink": "food/drink"}
+
+
+def display_category(category: str) -> str:
+    return DISPLAY_CATEGORY.get(category, category)
+
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
@@ -790,7 +798,7 @@ def handle_set_tracker(conn, chat_id, target_amount, duration_hours):
 def window_category_line(conn, window, category: str, limit_amount: float) -> str:
     spent = get_window_category_spent(conn, category, window["starts_at"])
     remaining = limit_amount - spent
-    line = f"{category}: ${spent:.2f}/${limit_amount:.2f}"
+    line = f"{display_category(category)}: ${spent:.2f}/${limit_amount:.2f}"
     if remaining >= 0:
         line += f" (${remaining:.2f} left)"
     else:
@@ -835,12 +843,16 @@ def handle_start_budget_window(conn, chat_id, tool_input):
             (starts_at,) = cur.fetchone()
         total_hours = (ends_at - starts_at).total_seconds() / 3600
 
-        lines = [f"{category}: ${amount:.2f}" for category, amount in sorted(current_limits.items())]
+        lines = [
+            f"{display_category(category)}: ${amount:.2f}"
+            for category, amount in sorted(current_limits.items())
+        ]
         reply = f"{casual_opener()}. Budgeting window locked in for {total_hours:g} hours:\n" + "\n".join(lines)
 
         missing = sorted(TRACKED_CATEGORIES - current_limits.keys())
         if missing:
-            reply += f"\nNo limit set for {', '.join(missing)}. Let me know if you want to add one (fine to skip too)."
+            missing_display = ', '.join(display_category(c) for c in missing)
+            reply += f"\nNo limit set for {missing_display}. Let me know if you want to add one (fine to skip too)."
 
         send_telegram_message(chat_id, reply)
         return _ok("budget window started")
@@ -850,11 +862,11 @@ def handle_start_budget_window(conn, chat_id, tool_input):
     if ends_at is None:
         still_need.append("how long it should run (or an end date)")
     if not current_limits:
-        still_need.append("at least one category limit (food_drink, groceries, transport)")
+        still_need.append("at least one category limit (food/drink, groceries, transport)")
 
     got = []
     if new_limits:
-        got.append(", ".join(f"{c} ${a:.2f}" for c, a in sorted(new_limits.items())))
+        got.append(", ".join(f"{display_category(c)} ${a:.2f}" for c, a in sorted(new_limits.items())))
     if duration_hours is not None:
         got.append(f"{duration_hours:g} hours")
 
@@ -872,7 +884,7 @@ def handle_add_window_limit(conn, chat_id, category, limit_amount):
     upsert_window_limit(conn, window["id"], category, limit_amount)
 
     send_telegram_message(
-        chat_id, f"{casual_opener()}, added {category} limit ${limit_amount:.2f} for this window."
+        chat_id, f"{casual_opener()}, added {display_category(category)} limit ${limit_amount:.2f} for this window."
     )
     return _ok("window limit added")
 
@@ -947,7 +959,7 @@ def handle_set_paycheck_limit(conn, chat_id, category, new_limit):
     conn.commit()
 
     send_telegram_message(
-        chat_id, f"{casual_opener()}, {category} paycheck period limit is now ${new_limit:.2f}."
+        chat_id, f"{casual_opener()}, {display_category(category)} paycheck period limit is now ${new_limit:.2f}."
     )
     return _ok("paycheck limit updated")
 
@@ -955,10 +967,10 @@ def handle_set_paycheck_limit(conn, chat_id, category, new_limit):
 def category_status_line(conn, category: str) -> str:
     budget = get_budget(conn, category)
     if not budget:
-        return f"{category}: no budget set"
+        return f"{display_category(category)}: no budget set"
     cycle_total = get_cycle_total(conn, category, budget)
     remaining = budget["cycle_limit"] - cycle_total
-    line = f"{category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period"
+    line = f"{display_category(category)}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period"
     if remaining >= 0:
         line += f" (${remaining:.2f} left)"
     else:
@@ -994,14 +1006,14 @@ def handle_correct_last_purchase(conn, chat_id, tool_input):
     updated_category = new_category or last["category"]
 
     reply = (
-        f"Corrected: {last['merchant']} ${last['amount']:.2f} ({last['category']}) -> "
-        f"{updated_merchant} ${updated_amount:.2f} ({updated_category})"
+        f"Corrected: {last['merchant']} ${last['amount']:.2f} ({display_category(last['category'])}) -> "
+        f"{updated_merchant} ${updated_amount:.2f} ({display_category(updated_category)})"
     )
 
     budget = get_budget(conn, updated_category)
     if budget:
         cycle_total = get_cycle_total(conn, updated_category, budget)
-        reply += f"\n{updated_category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period."
+        reply += f"\n{display_category(updated_category)}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period."
         if cycle_total > budget["cycle_limit"]:
             reply += overspend_tail(cycle_total - budget["cycle_limit"])
 
@@ -1020,7 +1032,7 @@ def handle_undo_last_purchase(conn, chat_id):
         return _ok("no transaction")
 
     delete_transaction(conn, last["id"])
-    reply = f"Removed: {last['merchant']}, ${last['amount']:.2f} ({last['category']})"
+    reply = f"Removed: {last['merchant']}, ${last['amount']:.2f} ({display_category(last['category'])})"
 
     if last["session_id"]:
         session_total = refresh_session_total(conn, last["session_id"])
@@ -1036,7 +1048,7 @@ def handle_log_purchase(conn, chat_id, text, parsed):
         # The user just resends a clearer message, which gets parsed fresh.
         reply = (
             f"Not sure that parsed right, best guess: {parsed['merchant']}, "
-            f"${parsed['amount']:.2f}, {parsed['category']} "
+            f"${parsed['amount']:.2f}, {display_category(parsed['category'])} "
             f"({parsed['confidence']:.0%} confidence). Resend with the merchant and amount spelled out."
         )
         send_telegram_message(chat_id, reply)
@@ -1045,8 +1057,8 @@ def handle_log_purchase(conn, chat_id, text, parsed):
     if parsed["category"] not in TRACKED_CATEGORIES:
         send_telegram_message(
             chat_id,
-            f"Not tracking {parsed['category']} purchases right now "
-            f"(just food_drink, groceries, and transport).",
+            f"Not tracking {display_category(parsed['category'])} purchases right now "
+            f"(just food/drink, groceries, and transport).",
         )
         return _ok("category not tracked")
 
@@ -1058,9 +1070,9 @@ def handle_log_purchase(conn, chat_id, text, parsed):
     if budget:
         cycle_total = get_cycle_total(conn, parsed["category"], budget)
 
-    reply = f"Logged: {parsed['merchant']}, ${parsed['amount']:.2f} ({parsed['category']})"
+    reply = f"Logged: {parsed['merchant']}, ${parsed['amount']:.2f} ({display_category(parsed['category'])})"
     if budget:
-        reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period."
+        reply += f"\n{display_category(parsed['category'])}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period."
         if cycle_total > budget["cycle_limit"]:
             reply += overspend_tail(cycle_total - budget["cycle_limit"])
     else:

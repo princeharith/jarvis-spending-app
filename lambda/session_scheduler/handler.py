@@ -24,6 +24,12 @@ WIND_DOWN_HOURS = 5
 MAX_SESSION_HOURS = 6
 GOING_OUT_CATEGORIES = ("food_drink",)
 
+DISPLAY_CATEGORY = {"food_drink": "food/drink"}
+
+
+def display_category(category: str) -> str:
+    return DISPLAY_CATEGORY.get(category, category)
+
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
@@ -160,7 +166,7 @@ def generate_checkin_message(
         f"- Out for {hours_elapsed:.1f} hours so far\n"
         f"- Spent ${running_total:.2f} tonight (~${pace_per_hour:.2f}/hour pace)\n"
         f"{target_line}"
-        f"- Remaining food_drink budget headroom this month: ${budget_headroom:.2f}\n\n"
+        f"- Remaining food/drink budget headroom this month: ${budget_headroom:.2f}\n\n"
         "Tone rules: serious and direct, never jokey or cutesy. NEVER use emoji, not even one. "
         "NEVER use an em dash, use a period or comma instead. "
         "If they're over or close to their stated target, spending fast relative to elapsed "
@@ -340,7 +346,7 @@ def process_budget_windows(conn):
                 )
                 (spent,) = cur.fetchone()
                 spent, limit_amount = float(spent), float(limit_amount)
-                line = f"{category}: ${spent:.2f}/${limit_amount:.2f}"
+                line = f"{display_category(category)}: ${spent:.2f}/${limit_amount:.2f}"
                 line += overspend_tail(spent - limit_amount) if spent > limit_amount else ", stayed under."
                 lines.append(line)
 
