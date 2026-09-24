@@ -249,6 +249,17 @@ GET_BUDGET_WINDOW_STATUS_TOOL = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
+CANCEL_BUDGET_WINDOW_TOOL = {
+    "name": "cancel_budget_window",
+    "description": (
+        "Call this when the user wants to cancel/end/stop their currently active or pending "
+        "ad-hoc budgeting window before its duration naturally runs out, e.g. 'cancel my "
+        "budgeting window', 'end this budgeting cycle', 'stop the window', 'scrap that "
+        "budget'. NOT for the standing paycheck period, which can't be cancelled this way."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
 
 CORRECT_LAST_TOOL = {
     "name": "correct_last_purchase",
@@ -338,6 +349,7 @@ def classify_message(raw_text: str, awaiting_target: bool, window_active: bool, 
         UNDO_LAST_TOOL,
         build_start_budget_window_tool(window_pending),
         GET_BUDGET_WINDOW_STATUS_TOOL,
+        CANCEL_BUDGET_WINDOW_TOOL,
         ACKNOWLEDGE_NO_SPEND_TOOL,
         GREET_TOOL,
     ]
@@ -879,6 +891,31 @@ def handle_get_budget_window_status(conn, chat_id):
     return _ok("window status")
 
 
+def handle_cancel_budget_window(conn, chat_id):
+    window = get_open_budget_window(conn)
+    if not window:
+        send_telegram_message(chat_id, "No active or pending budgeting window to cancel.")
+        return _ok("no open window")
+
+    limits = get_budget_window_limits(conn, window["id"])
+
+    with conn.cursor() as cur:
+        cur.execute("UPDATE budget_windows SET status = 'ended' WHERE id = %s", (window["id"],))
+    conn.commit()
+
+    if limits:
+        lines = [
+            window_category_line(conn, window, category, limit_amount)
+            for category, limit_amount in sorted(limits.items())
+        ]
+        reply = "Cancelled. Final numbers:\n" + "\n".join(lines)
+    else:
+        reply = "Cancelled the budgeting window setup."
+
+    send_telegram_message(chat_id, reply)
+    return _ok("window cancelled")
+
+
 def category_status_line(conn, category: str) -> str:
     budget = get_budget(conn, category)
     if not budget:
@@ -1073,6 +1110,8 @@ def lambda_handler(event, context):
                 return handle_start_budget_window(conn, chat_id, tool_input)
             elif tool_name == "get_budget_window_status":
                 return handle_get_budget_window_status(conn, chat_id)
+            elif tool_name == "cancel_budget_window":
+                return handle_cancel_budget_window(conn, chat_id)
             elif tool_name == "add_budget_window_category_limit":
                 return handle_add_window_limit(
                     conn, chat_id, tool_input["category"], tool_input["limit_amount"]
