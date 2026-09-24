@@ -271,6 +271,16 @@ ACKNOWLEDGE_NO_SPEND_TOOL = {
     "input_schema": {"type": "object", "properties": {}},
 }
 
+GREET_TOOL = {
+    "name": "greet",
+    "description": (
+        "Call this when the user is just greeting Jarvis or making small talk with no other "
+        "intent, e.g. 'hi', 'hey Jarvis', 'what's up', 'yo', 'good morning'. Not for anything "
+        "else, even if a greeting is combined with another intent (log/start/end/query first)."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
+
 REQUEST_BUDGET_WINDOW_DETAILS_TOOL = {
     "name": "request_budget_window_details",
     "description": (
@@ -320,6 +330,7 @@ def classify_message(raw_text: str, awaiting_target: bool, window_active: bool):
         GET_BUDGET_WINDOW_STATUS_TOOL,
         ACKNOWLEDGE_NO_SPEND_TOOL,
         REQUEST_BUDGET_WINDOW_DETAILS_TOOL,
+        GREET_TOOL,
     ]
     if awaiting_target:
         tools.append(SET_TARGET_TOOL)
@@ -768,6 +779,14 @@ def handle_acknowledge_no_spend(conn, chat_id):
     return _ok("acknowledged")
 
 
+GREETINGS = ["Yo", "Hey, what's up", "Sup", "What's good", "Hey"]
+
+
+def handle_greet(conn, chat_id):
+    send_telegram_message(chat_id, random.choice(GREETINGS))
+    return _ok("greeted")
+
+
 def handle_request_budget_window_details(conn, chat_id):
     send_telegram_message(
         chat_id,
@@ -992,6 +1011,8 @@ def lambda_handler(event, context):
                 return handle_acknowledge_no_spend(conn, chat_id)
             elif tool_name == "request_budget_window_details":
                 return handle_request_budget_window_details(conn, chat_id)
+            elif tool_name == "greet":
+                return handle_greet(conn, chat_id)
             else:
                 return handle_log_purchase(conn, chat_id, text, tool_input)
         finally:
