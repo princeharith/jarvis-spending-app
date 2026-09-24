@@ -295,12 +295,71 @@ def process_trackers(conn):
     return results
 
 
+def get_open_budget_windows(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, starts_at, ends_at FROM budget_windows WHERE status = 'active'")
+        rows = cur.fetchall()
+    return [{"id": r[0], "starts_at": r[1], "ends_at": r[2]} for r in rows]
+
+
+def get_budget_window_limits(conn, window_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT category, limit_amount FROM budget_window_limits WHERE window_id = %s ORDER BY category",
+            (window_id,),
+        )
+        rows = cur.fetchall()
+    return rows
+
+
+def close_budget_window(conn, window_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("UPDATE budget_windows SET status = 'ended' WHERE id = %s", (window_id,))
+    conn.commit()
+
+
+def process_budget_windows(conn):
+    results = []
+    now = datetime.now(timezone.utc)
+
+    for window in get_open_budget_windows(conn):
+        if now < window["ends_at"]:
+            results.append({"window_id": window["id"], "action": "not_due"})
+            continue
+
+        lines = []
+        with conn.cursor() as cur:
+            for category, limit_amount in get_budget_window_limits(conn, window["id"]):
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(amount), 0) FROM transactions
+                    WHERE category = %s AND logged_at >= %s AND logged_at <= %s
+                    """,
+                    (category, window["starts_at"], window["ends_at"]),
+                )
+                (spent,) = cur.fetchone()
+                spent, limit_amount = float(spent), float(limit_amount)
+                line = f"{category}: ${spent:.2f}/${limit_amount:.2f}"
+                line += overspend_tail(spent - limit_amount) if spent > limit_amount else " — stayed under."
+                lines.append(line)
+
+        send_telegram_message("Budgeting window done:\n" + "\n".join(lines))
+        close_budget_window(conn, window["id"])
+        results.append({"window_id": window["id"], "action": "closed"})
+
+    return results
+
+
 def lambda_handler(event, context):
     conn = get_db_connection()
     try:
         session_results = process_sessions(conn)
         tracker_results = process_trackers(conn)
-        logger.info("Sessions: %s | Trackers: %s", session_results, tracker_results)
-        return {"sessions": session_results, "trackers": tracker_results}
+        window_results = process_budget_windows(conn)
+        logger.info(
+            "Sessions: %s | Trackers: %s | Budget windows: %s",
+            session_results, tracker_results, window_results,
+        )
+        return {"sessions": session_results, "trackers": tracker_results, "budget_windows": window_results}
     finally:
         conn.close()

@@ -136,9 +136,12 @@ SET_TRACKER_TOOL = {
 GET_CYCLE_SUMMARY_TOOL = {
     "name": "get_cycle_summary",
     "description": (
-        "Call this when the user asks for a status/progress update on their spending this "
-        "cycle across all tracked categories, e.g. 'how am I doing this cycle', 'how's my "
-        "spending', 'give me a breakdown', 'where do I stand'."
+        "Call this when the user asks for a status/progress update on the PAYCHECK PERIOD "
+        "specifically — the standing semimonthly (1st-15th, 16th-end of month) budget, e.g. "
+        "'how am I doing this paycheck period', 'how's my paycheck period spending'. NOT for "
+        "an ad-hoc 'budgeting window'/'budgeting cycle' the user separately started with its "
+        "own per-category limits and duration — use get_budget_window_status for that, "
+        "especially for vaguer phrasing like 'how am I doing in my current cycle'."
     ),
     "input_schema": {"type": "object", "properties": {}},
 }
@@ -147,8 +150,11 @@ GET_CATEGORY_STATUS_TOOL = {
     "name": "get_category_status",
     "description": (
         "Call this when the user asks how much they've spent or have left in ONE specific "
-        "tracked category this cycle, e.g. 'how much do I have left in transport', 'how much "
-        "have I spent on food and drink', 'what's my groceries budget looking like'."
+        "tracked category for the paycheck period, e.g. 'how much do I have left in "
+        "transport', 'how much have I spent on food and drink', 'what's my groceries budget "
+        "looking like'. If a budgeting window is active and the user's phrasing suggests they "
+        "mean that instead (e.g. mentions 'this week', 'the window'), prefer "
+        "get_budget_window_status."
     ),
     "input_schema": {
         "type": "object",
@@ -161,6 +167,44 @@ GET_CATEGORY_STATUS_TOOL = {
         },
         "required": ["category"],
     },
+}
+
+START_BUDGET_WINDOW_TOOL = {
+    "name": "start_budget_window",
+    "description": (
+        "Call this when the user wants to start a new ad-hoc 'budgeting window' or 'budgeting "
+        "cycle' with per-category spending limits for some duration (a week, a weekend, 3 "
+        "days, etc.) — separate from the standing paycheck period. E.g. 'I want to start a "
+        "new budgeting cycle, food and drink $100, groceries $50, transport $30 for the next "
+        "week'. Give at least one category limit."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "duration_hours": {
+                "type": "number",
+                "description": (
+                    "How many hours the window lasts, as stated or implied "
+                    "(e.g. 'a week' -> 168, 'the weekend' -> 60, '3 days' -> 72)."
+                ),
+            },
+            "food_drink_limit": {"type": "number", "description": "Window limit for food_drink, if stated."},
+            "groceries_limit": {"type": "number", "description": "Window limit for groceries, if stated."},
+            "transport_limit": {"type": "number", "description": "Window limit for transport, if stated."},
+        },
+        "required": ["duration_hours"],
+    },
+}
+
+GET_BUDGET_WINDOW_STATUS_TOOL = {
+    "name": "get_budget_window_status",
+    "description": (
+        "Call this when the user asks how they're doing in their currently active ad-hoc "
+        "budgeting window/cycle (started via start_budget_window), e.g. 'how am I doing in "
+        "my current cycle', 'how's my budgeting window going', 'where do I stand this week'. "
+        "NOT for the standing paycheck period — use get_cycle_summary for that."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
 }
 
 
@@ -209,6 +253,8 @@ def classify_message(raw_text: str, awaiting_target: bool):
         GET_CATEGORY_STATUS_TOOL,
         CORRECT_LAST_TOOL,
         UNDO_LAST_TOOL,
+        START_BUDGET_WINDOW_TOOL,
+        GET_BUDGET_WINDOW_STATUS_TOOL,
     ]
     if awaiting_target:
         tools.append(SET_TARGET_TOOL)
@@ -457,6 +503,53 @@ def get_active_trackers(conn):
     ]
 
 
+def create_budget_window(conn, duration_hours: float, limits: dict) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO budget_windows (ends_at) VALUES (now() + (%s || ' hours')::interval) RETURNING id",
+            (duration_hours,),
+        )
+        (window_id,) = cur.fetchone()
+        for category, limit_amount in limits.items():
+            cur.execute(
+                "INSERT INTO budget_window_limits (window_id, category, limit_amount) VALUES (%s, %s, %s)",
+                (window_id, category, limit_amount),
+            )
+    conn.commit()
+    return window_id
+
+
+def get_active_budget_window(conn):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, starts_at, ends_at FROM budget_windows WHERE status = 'active' LIMIT 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {"id": row[0], "starts_at": row[1], "ends_at": row[2]}
+
+
+def get_budget_window_limits(conn, window_id: int) -> dict:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT category, limit_amount FROM budget_window_limits WHERE window_id = %s ORDER BY category",
+            (window_id,),
+        )
+        rows = cur.fetchall()
+    return {r[0]: float(r[1]) for r in rows}
+
+
+def get_window_category_spent(conn, category: str, starts_at) -> float:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE category = %s AND logged_at >= %s",
+            (category, starts_at),
+        )
+        (total,) = cur.fetchone()
+    return float(total)
+
+
 def send_telegram_message(chat_id, text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
@@ -532,13 +625,68 @@ def handle_set_tracker(conn, chat_id, target_amount, duration_hours):
     return _ok("tracker set")
 
 
+def window_category_line(conn, window, category: str, limit_amount: float) -> str:
+    spent = get_window_category_spent(conn, category, window["starts_at"])
+    remaining = limit_amount - spent
+    line = f"{category}: ${spent:.2f}/${limit_amount:.2f}"
+    if remaining >= 0:
+        line += f" (${remaining:.2f} left)"
+    else:
+        line += overspend_tail(-remaining)
+    return line
+
+
+def handle_start_budget_window(conn, chat_id, tool_input):
+    existing = get_active_budget_window(conn)
+    if existing:
+        send_telegram_message(
+            chat_id,
+            f"Already have a budgeting window running, ends {existing['ends_at']:%a %-I:%M %p}. "
+            "End it first (just let it run out) before starting a new one.",
+        )
+        return _ok("window already active")
+
+    limits = {
+        category: tool_input[f"{category}_limit"]
+        for category in TRACKED_CATEGORIES
+        if tool_input.get(f"{category}_limit") is not None
+    }
+    if not limits:
+        send_telegram_message(chat_id, "Give me at least one category limit to start a budgeting window.")
+        return _ok("no limits given")
+
+    duration_hours = tool_input["duration_hours"]
+    create_budget_window(conn, duration_hours, limits)
+
+    lines = [f"{category}: ${amount:.2f}" for category, amount in sorted(limits.items())]
+    reply = f"Budgeting window started for {duration_hours:g} hours:\n" + "\n".join(lines)
+    send_telegram_message(chat_id, reply)
+    return _ok("budget window started")
+
+
+def handle_get_budget_window_status(conn, chat_id):
+    window = get_active_budget_window(conn)
+    if not window:
+        send_telegram_message(chat_id, "No active budgeting window right now.")
+        return _ok("no active window")
+
+    limits = get_budget_window_limits(conn, window["id"])
+    lines = [
+        window_category_line(conn, window, category, limit_amount)
+        for category, limit_amount in sorted(limits.items())
+    ]
+    reply = f"Budgeting window (ends {window['ends_at']:%a %-I:%M %p}):\n" + "\n".join(lines)
+    send_telegram_message(chat_id, reply)
+    return _ok("window status")
+
+
 def category_status_line(conn, category: str) -> str:
     budget = get_budget(conn, category)
     if not budget:
         return f"{category}: no budget set"
     cycle_total = get_cycle_total(conn, category, budget)
     remaining = budget["cycle_limit"] - cycle_total
-    line = f"{category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this cycle"
+    line = f"{category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period"
     if remaining >= 0:
         line += f" (${remaining:.2f} left)"
     else:
@@ -548,7 +696,7 @@ def category_status_line(conn, category: str) -> str:
 
 def handle_get_cycle_summary(conn, chat_id):
     lines = [category_status_line(conn, category) for category in sorted(TRACKED_CATEGORIES)]
-    send_telegram_message(chat_id, "This cycle:\n" + "\n".join(lines))
+    send_telegram_message(chat_id, "Paycheck period:\n" + "\n".join(lines))
     return _ok("cycle summary")
 
 
@@ -581,7 +729,7 @@ def handle_correct_last_purchase(conn, chat_id, tool_input):
     budget = get_budget(conn, updated_category)
     if budget:
         cycle_total = get_cycle_total(conn, updated_category, budget)
-        reply += f"\n{updated_category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this cycle."
+        reply += f"\n{updated_category}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period."
         if cycle_total > budget["cycle_limit"]:
             reply += overspend_tail(cycle_total - budget["cycle_limit"])
 
@@ -640,7 +788,7 @@ def handle_log_purchase(conn, chat_id, text, parsed):
 
     reply = f"Logged: {parsed['merchant']} — ${parsed['amount']:.2f} ({parsed['category']})"
     if budget:
-        reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this cycle."
+        reply += f"\n{parsed['category']}: ${cycle_total:.2f}/${budget['cycle_limit']:.2f} this paycheck period."
         if cycle_total > budget["cycle_limit"]:
             reply += overspend_tail(cycle_total - budget["cycle_limit"])
     else:
@@ -656,6 +804,14 @@ def handle_log_purchase(conn, chat_id, text, parsed):
         reply += f"\nTracker: ${tracker['spent']:.2f}/${tracker['target_amount']:.2f}"
         if tracker["spent"] > tracker["target_amount"]:
             reply += overspend_tail(tracker["spent"] - tracker["target_amount"])
+
+    window = get_active_budget_window(conn)
+    if window:
+        window_limits = get_budget_window_limits(conn, window["id"])
+        if parsed["category"] in window_limits:
+            reply += "\nWindow " + window_category_line(
+                conn, window, parsed["category"], window_limits[parsed["category"]]
+            )
 
     send_telegram_message(chat_id, reply)
     return _ok()
@@ -711,6 +867,10 @@ def lambda_handler(event, context):
                 return handle_correct_last_purchase(conn, chat_id, tool_input)
             elif tool_name == "undo_last_purchase":
                 return handle_undo_last_purchase(conn, chat_id)
+            elif tool_name == "start_budget_window":
+                return handle_start_budget_window(conn, chat_id, tool_input)
+            elif tool_name == "get_budget_window_status":
+                return handle_get_budget_window_status(conn, chat_id)
             else:
                 return handle_log_purchase(conn, chat_id, text, tool_input)
         finally:
