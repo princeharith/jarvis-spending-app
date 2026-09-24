@@ -83,7 +83,7 @@ def get_going_out_budget_headroom(conn) -> float:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT category, cycle_limit, cycle_anchor, cycle_length_days
+            SELECT category, cycle_limit, cycle_type, cycle_anchor, cycle_length_days
             FROM budgets WHERE category = ANY(%s)
             """,
             (list(GOING_OUT_CATEGORIES),),
@@ -91,22 +91,37 @@ def get_going_out_budget_headroom(conn) -> float:
         budgets = cur.fetchall()
 
         remaining_total = 0.0
-        for category, cycle_limit, cycle_anchor, cycle_length_days in budgets:
-            cur.execute(
+        for category, cycle_limit, cycle_type, cycle_anchor, cycle_length_days in budgets:
+            if cycle_type == "semimonthly":
+                sql = """
+                    WITH bounds AS (
+                        SELECT CASE
+                            WHEN EXTRACT(DAY FROM CURRENT_DATE) <= 15
+                                THEN date_trunc('month', CURRENT_DATE)
+                            ELSE date_trunc('month', CURRENT_DATE) + INTERVAL '15 days'
+                        END AS cycle_start
+                    )
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM transactions, bounds
+                    WHERE category = %(category)s AND logged_at >= bounds.cycle_start
                 """
-                WITH bounds AS (
-                    SELECT (
-                        %(anchor)s::date + (
-                            ((CURRENT_DATE - %(anchor)s::date) / %(length)s::int) * %(length)s::int
-                        ) * INTERVAL '1 day'
-                    )::timestamptz AS cycle_start
-                )
-                SELECT COALESCE(SUM(amount), 0)
-                FROM transactions, bounds
-                WHERE category = %(category)s AND logged_at >= bounds.cycle_start
-                """,
-                {"anchor": cycle_anchor, "length": cycle_length_days, "category": category},
-            )
+                params = {"category": category}
+            else:
+                sql = """
+                    WITH bounds AS (
+                        SELECT (
+                            %(anchor)s::date + (
+                                ((CURRENT_DATE - %(anchor)s::date) / %(length)s::int) * %(length)s::int
+                            ) * INTERVAL '1 day'
+                        )::timestamptz AS cycle_start
+                    )
+                    SELECT COALESCE(SUM(amount), 0)
+                    FROM transactions, bounds
+                    WHERE category = %(category)s AND logged_at >= bounds.cycle_start
+                """
+                params = {"anchor": cycle_anchor, "length": cycle_length_days, "category": category}
+
+            cur.execute(sql, params)
             (cycle_total,) = cur.fetchone()
             remaining_total += float(cycle_limit) - float(cycle_total)
     return remaining_total
