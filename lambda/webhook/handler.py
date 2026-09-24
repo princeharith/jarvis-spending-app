@@ -31,9 +31,10 @@ def overspend_tail(over_by: float) -> str:
     return f" That's ${over_by:.2f} over. Cut it the fuck out."
 
 
-# Casual "talking to a friend" openers for routine setup confirmations (setting a
-# budget/tracker/session/window) — kept separate from overspend_tail, which stays
-# serious. Not used for purchase logs, warnings, or query results.
+# Openers for routine setup confirmations (setting a budget/tracker/session/window):
+# a mix of "talking to a friend" and Iron Man JARVIS-style AI butler lines. Kept
+# separate from overspend_tail, which stays serious. Not used for purchase logs,
+# warnings, or query results.
 CASUAL_OPENERS = [
     "Sure bro",
     "You got it brotha",
@@ -43,6 +44,10 @@ CASUAL_OPENERS = [
     "You got it chief",
     "Done deal",
     "Bet",
+    "Initiating budget protocol, sir",
+    "Initiating the save_money directive",
+    "Budget protocol engaged, sir",
+    "Save_money directive online",
 ]
 
 
