@@ -158,15 +158,6 @@ of this — the harness only loads agent definitions at session start, so they w
 mid-session. They should work normally in any fresh session. Prefer delegating schema/Lambda/
 Telegram-specific work to them per their descriptions rather than doing everything inline.
 
-## Housekeeping not yet done (non-blocking, flagged early, still true)
-
-- `jarvis-db`'s RDS security group still has an open `0.0.0.0/0` inbound rule alongside the
-  developer's IP. Should be locked down before this holds more sensitive data.
-- Old Plaid-era credentials (`PLAID_ACCESS_TOKEN`, `PLAID_SECRET`, old RDS master password) were
-  briefly exposed in pasted terminal output during Phase 0 and were never rotated.
-- An earlier Plaid/Amex-based version of this project exists under old naming
-  (`spending-app-webhook` Lambda, status unknown). Leave alone unless explicitly asked to clean up.
-
 ## Ideas for continuing (not committed to, just surfaced in chat)
 
 - Build an eval harness for `classify_message` — labeled example messages → expected tool/fields,
